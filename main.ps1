@@ -12,11 +12,47 @@
 
     FOR TEST PURPOSES ONLY - do not commit real credentials into this file.
 .EXAMPLE
+    # Full lifecycle (steps 1-7) using credentials from environment variables
     .\main.ps1 -WorkspaceId <ws> -CapacityId <cap> -FilterWorkspaceId <ws1>,<ws2>
 .EXAMPLE
+    # Full lifecycle passing the service principal explicitly
+    .\main.ps1 -TenantId <tenant> -ClientId <app> -ClientSecret <secret> `
+               -WorkspaceId <ws> -CapacityId <cap> -FilterWorkspaceId <ws1>,<ws2>
+.EXAMPLE
+    # 1) List policy sets in a workspace
     .\main.ps1 -Step List -WorkspaceId <ws>
 .EXAMPLE
-    .\main.ps1 -Step AddRule,RemoveWorkspaceFromRule -WorkspaceId <ws> -PolicySetId <ps> -FilterWorkspaceId <ws1>,<ws2>
+    # 2) Create a capacity-level policy set
+    .\main.ps1 -Step Create -WorkspaceId <ws> -CapacityId <cap> `
+               -PolicySetDisplayName 'UBS capacity policy set'
+.EXAMPLE
+    # 3) Get an existing policy set including its rules
+    .\main.ps1 -Step Get -WorkspaceId <ws> -PolicySetId <ps>
+.EXAMPLE
+    # 4) Add a capacity-level policy rule with a workspace filter
+    .\main.ps1 -Step AddRule -WorkspaceId <ws> -PolicySetId <ps> `
+               -FilterWorkspaceId <ws1>,<ws2> -Policy ExternalDataSharing -Operator AnyOf
+.EXAMPLE
+    # 5) Remove the first filter workspace from an existing rule
+    .\main.ps1 -Step RemoveWorkspaceFromRule -WorkspaceId <ws> -PolicySetId <ps> `
+               -PolicyRuleId <rule> -FilterWorkspaceId <ws1>
+.EXAMPLE
+    # 6) Delete a policy rule
+    .\main.ps1 -Step RemoveRule -WorkspaceId <ws> -PolicySetId <ps> -PolicyRuleId <rule>
+.EXAMPLE
+    # 7) Deactivate and delete a policy set
+    .\main.ps1 -Step RemovePolicySet -WorkspaceId <ws> -PolicySetId <ps>
+.EXAMPLE
+    # Create and inspect only, leaving the policy set in place
+    .\main.ps1 -Step Create,Get,AddRule -WorkspaceId <ws> -CapacityId <cap> `
+               -FilterWorkspaceId <ws1>,<ws2>
+.EXAMPLE
+    # Clean up an existing policy set and its rule
+    .\main.ps1 -Step RemoveRule,RemovePolicySet -WorkspaceId <ws> `
+               -PolicySetId <ps> -PolicyRuleId <rule>
+.EXAMPLE
+    # Verbose run to see every request URI
+    .\main.ps1 -Step List -WorkspaceId <ws> -Verbose
 #>
 [CmdletBinding()]
 param(
