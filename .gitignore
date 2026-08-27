@@ -1,0 +1,6 @@
+docs/
+
+# Local credential files
+.env
+*.env
+secrets.ps1
