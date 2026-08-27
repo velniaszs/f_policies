@@ -135,12 +135,22 @@ function Get-FabricErrorText {
     $status = ''
     $body   = $null
 
-    try { $status = [int]$ErrorRecord.Exception.Response.StatusCode } catch { }
-
-    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
-        $body = $ErrorRecord.ErrorDetails.Message
+    # PS 7 exposes HttpResponseMessage, PS 5.1 exposes HttpWebResponse; both have StatusCode.
+    try {
+        $code = $ErrorRecord.Exception.Response.StatusCode
+        if ($null -ne $code) { $status = '{0} {1}' -f [int]$code, $code }
     }
-    else {
+    catch { }
+
+    # PS 7 puts the response body here; PS 5.1 usually needs the stream below.
+    try {
+        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            $body = $ErrorRecord.ErrorDetails.Message
+        }
+    }
+    catch { }
+
+    if (-not $body) {
         try {
             $stream = $ErrorRecord.Exception.Response.GetResponseStream()
             $stream.Position = 0
@@ -162,6 +172,9 @@ function Get-FabricErrorText {
         }
         catch { }
     }
+
+    if (-not $detail) { $detail = $ErrorRecord.Exception.Message }
+    if (-not $status) { $status = 'no HTTP status' }
 
     "Fabric API request failed [$status]. $detail"
 }

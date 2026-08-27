@@ -52,10 +52,12 @@ do {
     Write-Verbose "GET $uri"
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers `
-            -ContentType 'application/json' -UseBasicParsing -ErrorAction Stop
+            -ContentType 'application/json' -ErrorAction Stop
     }
     catch {
-        throw (Get-FabricErrorText -ErrorRecord $_)
+        Write-Host (Get-FabricErrorText -ErrorRecord $_) -ForegroundColor Red
+        # Rethrow the original record so the native status code and body are not lost.
+        throw
     }
 
     $capacities += $response.value
