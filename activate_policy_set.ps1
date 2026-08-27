@@ -6,7 +6,10 @@
     POST https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/policySets/{policySetId}/activate
     POST .../activate?allowReplace={allowReplace}
 
-    Body: { "scopeId": <uuid>, "scopeType": "Tenant" | "Capacity" }
+    Body: { "scopeType": "Tenant" | "Capacity", "scopeId": <uuid>, "capacityId": <uuid> }
+
+    The reference documents scopeId, but the preview service validates capacityId and fails
+    with PropertyCannotBeDefault when it is absent, so both are sent for capacity scope.
 
     When -ScopeType/-ScopeId are omitted they are read from the policy set's own
     properties.scope, which avoids InvalidActivationScope (the activation scope type
