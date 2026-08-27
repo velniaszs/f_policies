@@ -76,10 +76,15 @@ if (-not $ScopeType -or -not $PSBoundParameters.ContainsKey('ScopeId')) {
 $uri = "$policySetUri/activate"
 if ($AllowReplace) { $uri += '?allowReplace=True' }
 
-$body = @{
-    scopeId   = $ScopeId.ToString()
+# The doc documents scopeId, but the live preview API rejects a missing capacityId
+# ("PropertyCannotBeDefault - property capacityId..."). Send both; unknown properties are ignored.
+$bodyMap = @{
     scopeType = $ScopeType
-} | ConvertTo-Json
+    scopeId   = $ScopeId.ToString()
+}
+if ($ScopeType -eq 'Capacity') { $bodyMap.capacityId = $ScopeId.ToString() }
+
+$body = $bodyMap | ConvertTo-Json
 
 $action = "Activate on $ScopeType scope $ScopeId"
 if ($AllowReplace) { $action += ' (replacing any active policy set)' }
