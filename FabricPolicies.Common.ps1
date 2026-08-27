@@ -19,6 +19,10 @@
 
     The service principal needs the Fabric tenant setting "Service principals can
     use Fabric APIs" enabled, plus the app permissions required by each operation.
+
+    Behind a corporate proxy that returns HTTP 407, set $env:FABRIC_PROXY (or the
+    standard HTTPS_PROXY / HTTP_PROXY) to the proxy URL. Current Windows credentials
+    are sent to the proxy automatically.
 #>
 
 Set-StrictMode -Version Latest
@@ -31,6 +35,26 @@ $script:FabricTenantId     = $null
 $script:FabricClientId     = $null
 $script:FabricClientSecret = $null   # SecureString
 $script:FabricTokenCache   = @{}     # scope -> @{ Token; Expiry }
+
+# Proxy setup runs at dot-source time so it applies to every Invoke-RestMethod call below.
+# Sending the current Windows identity to the proxy is what clears HTTP 407.
+try {
+    $defaultProxy = [System.Net.WebRequest]::DefaultWebProxy
+    if ($defaultProxy) {
+        $defaultProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    }
+}
+catch { }
+
+$script:FabricProxy = $env:FABRIC_PROXY
+if (-not $script:FabricProxy) { $script:FabricProxy = $env:HTTPS_PROXY }
+if (-not $script:FabricProxy) { $script:FabricProxy = $env:HTTP_PROXY }
+
+if ($script:FabricProxy) {
+    $global:PSDefaultParameterValues['Invoke-RestMethod:Proxy'] = $script:FabricProxy
+    $global:PSDefaultParameterValues['Invoke-RestMethod:ProxyUseDefaultCredentials'] = $true
+    Write-Verbose "Using proxy $($script:FabricProxy) with default credentials."
+}
 
 function Set-FabricCredential {
     <#

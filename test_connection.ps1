@@ -40,8 +40,11 @@ function ConvertFrom-JwtPayload {
 
 # --- 1. Environment -----------------------------------------------------------
 Write-Section 'PowerShell'
-$PSVersionTable | Format-List PSVersion, PSEdition, OS | Out-Host
-Write-Host "Invoke-RestMethod supports -Method Patch: $((Get-Command Invoke-RestMethod).Parameters['Method'].ParameterType.GetEnumNames() -contains 'Patch')"
+[pscustomobject]@{
+    PSVersion = $PSVersionTable.PSVersion
+    PSEdition = $PSVersionTable.PSEdition
+    Platform  = if ($PSVersionTable.Contains('Platform')) { $PSVersionTable.Platform } else { 'Win32NT' }
+} | Format-List | Out-Host
 
 # --- 2. Network ---------------------------------------------------------------
 Write-Section 'Network reachability'
