@@ -3,6 +3,8 @@
 .SYNOPSIS
     Adds a policy rule to a capacity-scoped policy set, filtered on workspace IDs.
 .DESCRIPTION
+    POST https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/policySets/{policySetId}/policyRules
+
     Creates a rule with a single Dynamic condition on 'workspace.id' and an Allow effect.
     Use -Operator NoneOf to invert the filter (allow everywhere except the listed workspaces).
 .EXAMPLE
@@ -58,10 +60,21 @@ $body = @{
     effects     = @(
         @{ type = 'Allow' }
     )
-}
+} | ConvertTo-Json -Depth 10
 
 if (-not $PSCmdlet.ShouldProcess("policy set $PolicySetId", "Create '$Policy' rule '$DisplayName' ($Operator on $($FilterWorkspaceId.Count) workspace(s))")) {
     return
 }
 
-Invoke-FabricApi -Method Post -Path "workspaces/$WorkspaceId/policySets/$PolicySetId/policyRules" -Body $body
+$headers = @{ Authorization = "Bearer $(Get-FabricToken)" }
+$uri = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId/policySets/$PolicySetId/policyRules"
+
+Write-Verbose "POST $uri"
+try {
+    Invoke-RestMethod -Uri $uri -Method Post -Headers $headers `
+        -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
+        -ContentType 'application/json; charset=utf-8' -UseBasicParsing -ErrorAction Stop
+}
+catch {
+    throw (Get-FabricErrorText -ErrorRecord $_)
+}

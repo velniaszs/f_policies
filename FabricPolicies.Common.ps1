@@ -1,10 +1,13 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Shared helpers for the Fabric Policies (PolicySet) private-preview REST APIs.
+    Authentication helpers for the Fabric Policies (PolicySet) private-preview REST APIs.
 .DESCRIPTION
     Dot-source this file from the operation scripts:
         . (Join-Path $PSScriptRoot 'FabricPolicies.Common.ps1')
+
+    Provides only a token and an error formatter - each script issues its own
+    Invoke-RestMethod call so the exact HTTP request stays visible.
 
     Authentication uses the Microsoft Entra client credentials flow (app-only).
     Supply the service principal either via parameters on each script, or via
@@ -20,15 +23,14 @@
 
 Set-StrictMode -Version Latest
 
-$script:FabricApiBaseUrl  = 'https://api.fabric.microsoft.com/v1'
 $script:FabricApiScope    = 'https://api.fabric.microsoft.com/.default'
+$script:PowerBiApiScope   = 'https://analysis.windows.net/powerbi/api/.default'
 $script:FabricAuthority   = 'https://login.microsoftonline.com'
 
 $script:FabricTenantId     = $null
 $script:FabricClientId     = $null
 $script:FabricClientSecret = $null   # SecureString
-$script:FabricAccessToken  = $null
-$script:FabricTokenExpiry  = [datetime]::MinValue
+$script:FabricTokenCache   = @{}     # scope -> @{ Token; Expiry }
 
 function Set-FabricCredential {
     <#
@@ -45,8 +47,7 @@ function Set-FabricCredential {
     $script:FabricTenantId     = $TenantId
     $script:FabricClientId     = $ClientId
     $script:FabricClientSecret = $ClientSecret
-    $script:FabricAccessToken  = $null
-    $script:FabricTokenExpiry  = [datetime]::MinValue
+    $script:FabricTokenCache   = @{}
 }
 
 function Initialize-FabricAuth {
@@ -75,12 +76,21 @@ function Initialize-FabricAuth {
 }
 
 function Get-FabricToken {
+    <#
+    .SYNOPSIS
+        Acquires a client-credentials access token, cached per scope.
+    .PARAMETER Scope
+        Defaults to the Fabric API. Pass $script:PowerBiApiScope for the Power BI admin APIs.
+    #>
     [CmdletBinding()]
     [OutputType([string])]
-    param()
+    param(
+        [string]$Scope = $script:FabricApiScope
+    )
 
-    if ($script:FabricAccessToken -and (Get-Date) -lt $script:FabricTokenExpiry) {
-        return $script:FabricAccessToken
+    $cached = $script:FabricTokenCache[$Scope]
+    if ($cached -and (Get-Date) -lt $cached.Expiry) {
+        return $cached.Token
     }
 
     if (-not $script:FabricTenantId) { Initialize-FabricAuth }
@@ -90,7 +100,7 @@ function Get-FabricToken {
     $body = @{
         client_id     = $script:FabricClientId
         client_secret = $secret
-        scope         = $script:FabricApiScope
+        scope         = $Scope
         grant_type    = 'client_credentials'
     }
 
@@ -101,18 +111,20 @@ function Get-FabricToken {
             -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -ErrorAction Stop
     }
     catch {
-        throw "Token request failed for client $($script:FabricClientId): $(Get-FabricErrorText -ErrorRecord $_)"
+        throw "Token request failed for client $($script:FabricClientId) and scope $($Scope): $(Get-FabricErrorText -ErrorRecord $_)"
     }
     finally {
         $secret = $null
         $body   = $null
     }
 
-    $script:FabricAccessToken = $response.access_token
     # Renew a minute early to avoid using a token that expires mid-request.
-    $script:FabricTokenExpiry = (Get-Date).AddSeconds([int]$response.expires_in - 60)
+    $script:FabricTokenCache[$Scope] = @{
+        Token  = $response.access_token
+        Expiry = (Get-Date).AddSeconds([int]$response.expires_in - 60)
+    }
 
-    $script:FabricAccessToken
+    $script:FabricTokenCache[$Scope].Token
 }
 
 function Get-FabricErrorText {
@@ -152,134 +164,4 @@ function Get-FabricErrorText {
     }
 
     "Fabric API request failed [$status]. $detail"
-}
-
-function Get-FabricRetryAfterSeconds {
-    [CmdletBinding()]
-    [OutputType([int])]
-    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord)
-
-    try {
-        $headers = $ErrorRecord.Exception.Response.Headers
-        $value = $null
-        if ($headers -is [System.Net.WebHeaderCollection]) { $value = $headers['Retry-After'] }
-        else { $value = ($headers.GetValues('Retry-After') | Select-Object -First 1) }
-        if ($value) { return [int]$value }
-    }
-    catch { }
-
-    30
-}
-
-function Invoke-FabricApi {
-    <#
-    .SYNOPSIS
-        Calls a Fabric REST endpoint, honouring 429 Retry-After and optional continuation-token paging.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateSet('Get', 'Post', 'Patch', 'Put', 'Delete')]
-        [string]$Method,
-
-        # Path relative to https://api.fabric.microsoft.com/v1, e.g. 'workspaces/{id}/policySets'
-        [Parameter(Mandatory)]
-        [string]$Path,
-
-        [hashtable]$Query,
-
-        $Body,
-
-        # Follow continuationToken and return the flattened contents of the named collection property.
-        [string]$CollectionProperty,
-
-        [int]$MaxRetries = 5
-    )
-
-    $headers = @{ Authorization = "Bearer $(Get-FabricToken)" }
-
-    $queryPairs = @()
-    if ($Query) {
-        foreach ($key in $Query.Keys) {
-            $value = $Query[$key]
-            if ($null -ne $value -and "$value" -ne '') {
-                $queryPairs += '{0}={1}' -f [uri]::EscapeDataString($key), [uri]::EscapeDataString("$value")
-            }
-        }
-    }
-
-    $jsonBody = $null
-    if ($null -ne $Body) { $jsonBody = $Body | ConvertTo-Json -Depth 25 }
-
-    $collected = @()
-    $continuationToken = $null
-
-    while ($true) {
-        $pairs = $queryPairs
-        if ($continuationToken) {
-            $pairs = $pairs + ('continuationToken={0}' -f [uri]::EscapeDataString($continuationToken))
-        }
-
-        $uri = '{0}/{1}' -f $script:FabricApiBaseUrl, $Path.TrimStart('/')
-        if ($pairs.Count) { $uri += '?' + ($pairs -join '&') }
-
-        Write-Verbose "$Method $uri"
-
-        $attempt = 0
-        $response = $null
-        while ($true) {
-            try {
-                $params = @{
-                    Uri             = $uri
-                    Method          = $Method
-                    Headers         = $headers
-                    ContentType     = 'application/json; charset=utf-8'
-                    UseBasicParsing = $true
-                    ErrorAction     = 'Stop'
-                }
-                if ($jsonBody) { $params.Body = [System.Text.Encoding]::UTF8.GetBytes($jsonBody) }
-
-                $raw = Invoke-WebRequest @params
-                if ($raw.Content) { $response = $raw.Content | ConvertFrom-Json }
-                break
-            }
-            catch {
-                $status = 0
-                try { $status = [int]$_.Exception.Response.StatusCode } catch { }
-
-                if ($status -eq 429 -and $attempt -lt $MaxRetries) {
-                    $wait = Get-FabricRetryAfterSeconds -ErrorRecord $_
-                    Write-Warning "Throttled (429). Retrying in $wait second(s)..."
-                    Start-Sleep -Seconds $wait
-                    $attempt++
-                    continue
-                }
-
-                throw (Get-FabricErrorText -ErrorRecord $_)
-            }
-        }
-
-        if (-not $CollectionProperty) { return $response }
-
-        if ($response -and ($response.PSObject.Properties.Name -contains $CollectionProperty)) {
-            $collected += $response.$CollectionProperty
-        }
-
-        $continuationToken = $null
-        if ($response -and ($response.PSObject.Properties.Name -contains 'continuationToken')) {
-            $continuationToken = $response.continuationToken
-        }
-        if (-not $continuationToken) { return $collected }
-    }
-}
-
-function Get-FabricPolicyRuleInternal {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][guid]$WorkspaceId,
-        [Parameter(Mandatory)][guid]$PolicySetId,
-        [Parameter(Mandatory)][guid]$PolicyRuleId
-    )
-
-    Invoke-FabricApi -Method Get -Path "workspaces/$WorkspaceId/policySets/$PolicySetId/policyRules/$PolicyRuleId"
 }

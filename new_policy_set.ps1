@@ -41,13 +41,24 @@ $body = @{
             id   = $CapacityId.ToString()
         }
     }
-}
+} | ConvertTo-Json -Depth 10
 
 if (-not $PSCmdlet.ShouldProcess("workspace $WorkspaceId", "Create capacity policy set '$DisplayName' on capacity $CapacityId")) {
     return
 }
 
-$policySet = Invoke-FabricApi -Method Post -Path "workspaces/$WorkspaceId/policySets" -Body $body
+$headers = @{ Authorization = "Bearer $(Get-FabricToken)" }
+$uri = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId/policySets"
+
+Write-Verbose "POST $uri"
+try {
+    $policySet = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers `
+        -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
+        -ContentType 'application/json; charset=utf-8' -UseBasicParsing -ErrorAction Stop
+}
+catch {
+    throw (Get-FabricErrorText -ErrorRecord $_)
+}
 
 Write-Verbose "Created policy set $($policySet.id)"
 $policySet

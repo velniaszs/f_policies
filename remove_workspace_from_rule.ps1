@@ -3,6 +3,9 @@
 .SYNOPSIS
     Removes one or more workspace IDs from the 'workspace.id' filter of an existing policy rule.
 .DESCRIPTION
+    GET   https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/policySets/{policySetId}/policyRules/{policyRuleId}
+    PATCH https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/policySets/{policySetId}/policyRules/{policyRuleId}
+
     Reads the rule, drops the given IDs from the predicate values of its 'workspace.id'
     condition, and PATCHes the full conditions array back (PATCH replaces conditions wholesale).
 
@@ -34,7 +37,17 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'FabricPolicies.Common.ps1')
 Initialize-FabricAuth -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
 
-$rule = Get-FabricPolicyRuleInternal -WorkspaceId $WorkspaceId -PolicySetId $PolicySetId -PolicyRuleId $PolicyRuleId
+$headers = @{ Authorization = "Bearer $(Get-FabricToken)" }
+$ruleUri = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId/policySets/$PolicySetId/policyRules/$PolicyRuleId"
+
+Write-Verbose "GET $ruleUri"
+try {
+    $rule = Invoke-RestMethod -Uri $ruleUri -Method Get -Headers $headers `
+        -ContentType 'application/json' -UseBasicParsing -ErrorAction Stop
+}
+catch {
+    throw (Get-FabricErrorText -ErrorRecord $_)
+}
 
 $condition = $rule.conditions | Where-Object {
     $_.type -eq 'Dynamic' -and $_.targetProperty -eq 'workspace.id'
@@ -85,12 +98,18 @@ $conditions = foreach ($existing in $rule.conditions) {
     }
 }
 
-$body = @{ conditions = @($conditions) }
+$body = @{ conditions = @($conditions) } | ConvertTo-Json -Depth 10
 
 if (-not $PSCmdlet.ShouldProcess("policy rule $PolicyRuleId", "Remove $($removed.Count) workspace ID(s) from the workspace.id filter")) {
     return
 }
 
-Invoke-FabricApi -Method Patch `
-    -Path "workspaces/$WorkspaceId/policySets/$PolicySetId/policyRules/$PolicyRuleId" `
-    -Body $body
+Write-Verbose "PATCH $ruleUri"
+try {
+    Invoke-RestMethod -Uri $ruleUri -Method Patch -Headers $headers `
+        -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
+        -ContentType 'application/json; charset=utf-8' -UseBasicParsing -ErrorAction Stop
+}
+catch {
+    throw (Get-FabricErrorText -ErrorRecord $_)
+}
