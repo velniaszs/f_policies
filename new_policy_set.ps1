@@ -3,15 +3,31 @@
 .SYNOPSIS
     Creates a capacity-scoped policy set in a workspace.
 .DESCRIPTION
-    NOTE: "Items - Create Policy Set" is listed in the operations table of
-    'Fabric Policies - REST API Reference.docx' but the document contains no detailed
-    section for it. The request shape below follows the Items group convention
-    (POST to the collection, PolicySetProperties body). Verify against the live
-    private-preview spec if the call fails with InvalidRequest.
+    POST https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/policySets
+
+    "Items - Create Policy Set" is listed in the operations table of the private-preview
+    reference but has no detailed section, so the request body here is derived from
+    observed API behaviour rather than documentation:
+
+      - the service rejects a body without workloadPayload ("workloadPayload is required")
+      - activation showed the service uses capacityId where the doc says scopeId
+
+    Use -PayloadAsString if the service wants workloadPayload as an escaped JSON string,
+    or -BodyJson to send a hand-written body and bypass all guessing.
 .EXAMPLE
-    .\new_policy_set.ps1 -WorkspaceId cfafbeb1-8037-4d0c-896e-a46fb27ff229 `
-                         -CapacityId 3f9c2b6e-7a41-4c8d-9e5f-1b2a6d7c8e90 `
-                         -DisplayName 'UBS capacity policy set'
+    .\new_policy_set.ps1 -WorkspaceId <ws> -CapacityId <cap> -DisplayName 'UBS capacity policy set'
+.EXAMPLE
+    # Send workloadPayload as an escaped JSON string instead of an object
+    .\new_policy_set.ps1 -WorkspaceId <ws> -CapacityId <cap> -DisplayName 'Test' -PayloadAsString
+.EXAMPLE
+    # Full manual control while the create contract is unconfirmed
+    .\new_policy_set.ps1 -WorkspaceId <ws> -DisplayName ignored -CapacityId <cap> -Verbose -BodyJson @'
+    {
+      "displayName": "Test",
+      "description": "",
+      "workloadPayload": { "scopeType": "Capacity", "capacityId": "<cap>" }
+    }
+'@
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -21,6 +37,10 @@ param(
 
     [ValidateLength(0, 256)]
     [string]$Description = '',
+
+    [switch]$PayloadAsString,
+
+    [string]$BodyJson,
 
     [string]$TenantId,
     [string]$ClientId,
@@ -32,16 +52,23 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'FabricPolicies.Common.ps1')
 Initialize-FabricAuth -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
 
-$body = @{
-    displayName = $DisplayName
-    description = $Description
-    properties  = @{
-        scope = @{
-            type = 'Capacity'
-            id   = $CapacityId.ToString()
-        }
+if ($BodyJson) {
+    $body = $BodyJson
+}
+else {
+    $payload = @{
+        scopeType  = 'Capacity'
+        capacityId = $CapacityId.ToString()
     }
-} | ConvertTo-Json -Depth 10
+
+    $bodyMap = @{
+        displayName     = $DisplayName
+        description     = $Description
+        workloadPayload = if ($PayloadAsString) { $payload | ConvertTo-Json -Compress } else { $payload }
+    }
+
+    $body = $bodyMap | ConvertTo-Json -Depth 10
+}
 
 if (-not $PSCmdlet.ShouldProcess("workspace $WorkspaceId", "Create capacity policy set '$DisplayName' on capacity $CapacityId")) {
     return
@@ -51,13 +78,15 @@ $headers = @{ Authorization = "Bearer $(Get-FabricToken)" }
 $uri = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId/policySets"
 
 Write-Verbose "POST $uri"
+Write-Verbose $body
 try {
     $policySet = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers `
         -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
-        -ContentType 'application/json; charset=utf-8' -UseBasicParsing -ErrorAction Stop
+        -ContentType 'application/json; charset=utf-8' -ErrorAction Stop
 }
 catch {
-    throw (Get-FabricErrorText -ErrorRecord $_)
+    Write-Host (Get-FabricErrorText -ErrorRecord $_) -ForegroundColor Red
+    throw
 }
 
 Write-Verbose "Created policy set $($policySet.id)"
