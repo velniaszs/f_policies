@@ -112,6 +112,8 @@ if ($TenantId)     { $auth.TenantId = $TenantId }
 if ($ClientId)     { $auth.ClientId = $ClientId }
 if ($ClientSecret) { $auth.ClientSecret = $ClientSecret }
 
+$script:ThrottleCount = 0
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -175,6 +177,7 @@ function Invoke-WithRetry {
             if ((Get-HttpStatusCode -ErrorRecord $_) -ne 429 -or $attempt -ge $MaxRetries) { throw }
 
             $attempt++
+            $script:ThrottleCount++
             $wait = Get-RetryAfterSeconds -ErrorRecord $_ -Default $RetryAfterSeconds
             Write-Warning "429 Too Many Requests on $Description. Waiting $wait s (retry $attempt/$MaxRetries)."
             Start-Sleep -Seconds $wait
@@ -194,6 +197,16 @@ function New-DynamicCondition {
         targetProperty = $TargetProperty
         predicate      = @{ operator = $Operator; values = @($Values) }
     }
+}
+
+function Get-Percentile {
+    param([double[]]$Values, [double]$Percentile)
+
+    if ($Values.Count -eq 0) { return 0 }
+    $sorted = @($Values | Sort-Object)
+    $index = [int][Math]::Ceiling($Percentile / 100 * $sorted.Count) - 1
+    if ($index -lt 0) { $index = 0 }
+    $sorted[$index]
 }
 
 # ---------------------------------------------------------------------------
@@ -300,8 +313,11 @@ foreach ($set in @(Invoke-WithRetry -Description 'list policy sets' -Action {
 # ---------------------------------------------------------------------------
 
 $results = @()
+$index = 0
+$runStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 foreach ($capacity in $capacities) {
+    $index++
     $name = "$NamePrefix$($capacity.displayName)"
     $result = [pscustomobject]@{
         capacityId   = $capacity.id
@@ -309,13 +325,18 @@ foreach ($capacity in $capacities) {
         policySetName = $name
         policySetId  = $null
         action       = 'Skipped'
+        workspaces   = 0
         rules        = 0
         activated    = $false
+        createMs     = 0
+        rulesMs      = 0
+        activateMs   = 0
+        totalMs      = 0
         error        = $null
     }
 
     Write-Host ''
-    Write-Host ("--- {0} ({1})" -f $capacity.displayName, $capacity.id) -ForegroundColor Cyan
+    Write-Host ("--- [{0}/{1}] {2} ({3})" -f $index, $capacities.Count, $capacity.displayName, $capacity.id) -ForegroundColor Cyan
 
     try {
         # 1) Create or reuse the policy set.
@@ -330,6 +351,7 @@ foreach ($capacity in $capacities) {
             Write-Host "Reusing policy set $($policySet.id)." -ForegroundColor DarkGray
         }
         elseif ($PSCmdlet.ShouldProcess("workspace $WorkspaceId", "Create policy set '$name' on capacity $($capacity.id)")) {
+            $createStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             $created = Invoke-WithRetry -Description "create policy set '$name'" -Action {
                 & (Join-Path $PSScriptRoot 'new_policy_set.ps1') @auth `
                     -WorkspaceId $WorkspaceId `
@@ -338,9 +360,12 @@ foreach ($capacity in $capacities) {
                     -Description "Item creation policy for capacity $($capacity.displayName)" `
                     -Confirm:$false
             }
+            $createStopwatch.Stop()
+
             $result.policySetId = $created.id
             $result.action = 'Created'
-            Write-Host "Created policy set $($created.id)." -ForegroundColor Green
+            $result.createMs = [int]$createStopwatch.ElapsedMilliseconds
+            Write-Host ("Created policy set {0} in {1} ms." -f $created.id, $result.createMs) -ForegroundColor Green
         }
         else {
             $results += $result
@@ -361,6 +386,7 @@ foreach ($capacity in $capacities) {
 
         $approved = $workspacesByCapacity[$capacity.id]
         if ($approved -and $approved.Count -gt 0) {
+            $result.workspaces = $approved.Count
             # A single workspace.id condition holds at most -MaxWorkspacesPerRule values, so long
             # whitelists are spread over several otherwise identical rules.
             $batches = @()
@@ -405,18 +431,22 @@ foreach ($capacity in $capacities) {
             Write-Verbose "POST $uri"
             Write-Verbose $body
 
+            $rulesStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             Invoke-WithRetry -Description "replace $Policy rules" -Action {
                 $headers = @{ Authorization = "Bearer $(Get-FabricToken)" }
                 Invoke-RestMethod -Uri $uri -Method Post -Headers $headers `
                     -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
                     -ContentType 'application/json; charset=utf-8' -ErrorAction Stop
             } | Out-Null
+            $rulesStopwatch.Stop()
 
-            Write-Host "Applied $($rules.Count) $Policy rule(s)." -ForegroundColor Green
+            $result.rulesMs = [int]$rulesStopwatch.ElapsedMilliseconds
+            Write-Host ("Applied {0} {1} rule(s) in {2} ms." -f $rules.Count, $Policy, $result.rulesMs) -ForegroundColor Green
         }
 
         # 3) Activate on the capacity.
         if (-not $SkipActivate) {
+            $activateStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             try {
                 Invoke-WithRetry -Description "activate policy set $($result.policySetId)" -Action {
                     & (Join-Path $PSScriptRoot 'activate_policy_set.ps1') @auth `
@@ -434,22 +464,59 @@ foreach ($capacity in $capacities) {
                 }
                 else { throw }
             }
+            finally {
+                $activateStopwatch.Stop()
+                $result.activateMs = [int]$activateStopwatch.ElapsedMilliseconds
+            }
         }
+
+        $result.totalMs = $result.createMs + $result.rulesMs + $result.activateMs
     }
     catch {
         $result.error = (Get-FabricErrorText -ErrorRecord $_)
         Write-Host $result.error -ForegroundColor Red
     }
 
+    if (-not $result.error -and $result.policySetId) {
+        Write-Host ("[{0}/{1}] {2,-28} {3,-9} ws={4,-4} rules={5,-3} create={6,6} ms  rules={7,6} ms  activate={8,6} ms" -f `
+            $index, $capacities.Count, $result.capacityName, $result.action,
+            $result.workspaces, $result.rules,
+            $result.createMs, $result.rulesMs, $result.activateMs) -ForegroundColor DarkGray
+    }
+
     $results += $result
 }
 
+$runStopwatch.Stop()
+
 Write-Host ''
 Write-Host '=== Summary ===' -ForegroundColor Cyan
-$results | Format-Table capacityName, policySetName, policySetId, action, rules, activated -AutoSize | Out-Host
+$results | Format-Table capacityName, policySetName, action, workspaces, rules, activated, totalMs -AutoSize | Out-Host
 
-$failed = @($results | Where-Object { $_.error })
+$succeeded = @($results | Where-Object { -not $_.error -and $_.policySetId })
+$failed    = @($results | Where-Object { $_.error })
+
+Write-Host ("Elapsed          : {0:n1} s" -f $runStopwatch.Elapsed.TotalSeconds)
+Write-Host ("Capacities       : {0} created, {1} updated, {2} failed, {3} total" -f `
+    @($succeeded | Where-Object { $_.action -eq 'Created' }).Count,
+    @($succeeded | Where-Object { $_.action -eq 'Updated' }).Count,
+    $failed.Count, $capacities.Count)
+Write-Host ("HTTP 429 retries : {0}" -f $script:ThrottleCount)
+
+if ($succeeded.Count -gt 0) {
+    foreach ($metric in 'createMs', 'rulesMs', 'activateMs', 'totalMs') {
+        $values = [double[]]@($succeeded.$metric)
+        Write-Host ("{0,-16} : avg {1,6:n0} ms  p50 {2,6:n0}  p95 {3,6:n0}  max {4,6:n0}" -f `
+            $metric,
+            ($values | Measure-Object -Average).Average,
+            (Get-Percentile -Values $values -Percentile 50),
+            (Get-Percentile -Values $values -Percentile 95),
+            ($values | Measure-Object -Maximum).Maximum)
+    }
+}
+
 if ($failed.Count -gt 0) {
+    Write-Host ''
     Write-Host "$($failed.Count) capacity(ies) failed:" -ForegroundColor Red
     $failed | ForEach-Object { Write-Host " - $($_.capacityName): $($_.error)" -ForegroundColor Red }
 }
