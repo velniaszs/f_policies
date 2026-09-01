@@ -16,9 +16,9 @@
     "creationPayload" and "definition" are mutually exclusive. Use -DefinitionPayload to send a
     policySet.json item definition instead of a creation payload, or -BodyJson for a hand-written body.
 
-    The definition path must carry PolicySetDefinition.format = 'beta'; without it the request falls
-    through to the generic create-item-with-definition handler and fails with
-    "UnsupportedItemType - requested itemType PolicySet is unsupported".
+    The definition path is documented with format 'beta' and is not enabled in every tenant/region -
+    it can fail with "UnsupportedItemType - requested itemType PolicySet is unsupported". Fall back to
+    -ScopeType/-CapacityId plus add_policy_rule.ps1 when that happens.
 
     The operation is long running: the service answers 201 with the created policy set, or 202 with
     Location / x-ms-operation-id / Retry-After headers. On 202 this script polls the operation until it
