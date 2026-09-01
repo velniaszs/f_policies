@@ -8,32 +8,49 @@
       1. Ensure a policy set named "<NamePrefix><capacityDisplayName>" exists in -WorkspaceId,
          scoped to that capacity (created when missing, reused when already there).
       2. Replace the ItemCreation rules of that policy set with:
-           Rule 1 - item.type NoneOf [<RestrictedItemType>]
-                    every other item type stays allowed on the capacity.
-           Rule 2 - item.type AnyOf [<RestrictedItemType>] AND workspace.id AnyOf [<csv workspaces>]
-                    only added when the CSV lists workspaces for the capacity.
+           Rule 1 - deny all. The API has no Deny effect, so this is an Allow rule whose condition
+                    can never match (workspace.id AnyOf the -DenyAllSentinelWorkspaceId sentinel).
+                    It grants nothing; its job is to keep the policy present so that anything not
+                    explicitly allowed by rule 2 is refused. Item types the policy does not govern
+                    (Report, SemanticModel, ...) are unaffected and stay creatable.
+           Rule 2 - item.type AnyOf [<item type CSV>] AND workspace.id AnyOf [<workspace CSV>]
+                    only added when the workspace CSV lists workspaces for the capacity. A condition
+                    holds at most -MaxWorkspacesPerRule workspaces, so longer whitelists are split
+                    over several identical rules ("... (1/3)", "... (2/3)", ...).
       3. Activate the policy set on the capacity.
 
     Rules are written with POST .../policyRules/replaceByPolicy, which overwrites all rules of the
     given policy. That makes re-runs idempotent: the script can be used both to create and to update.
 
-    The CSV lists the workspaces whitelisted for <RestrictedItemType> creation and needs the columns:
+    Two CSVs drive the whitelist.
+
+    -CsvPath maps capacities to the workspaces allowed to create the listed item types:
 
         capacity_id,workspace_id
 
-    One row per capacity/workspace pair; capacities absent from the file get rule 1 only, which leaves
-    <RestrictedItemType> creation blocked across the whole capacity.
+    One row per capacity/workspace pair; capacities absent from the file get rule 1 only, which denies
+    creation of every governed item type across the whole capacity.
     See fabric_workspaces.sample.csv for the expected shape.
+
+    -ItemTypeCsvPath lists the item types those workspaces may create. item_name is documentation only;
+    item_type must be a Fabric ItemType enum value and duplicates are collapsed:
+
+        item_name,item_type
+
+    See fabric_item_types.sample.csv for the expected shape.
 
     HTTP 429 responses are retried up to -MaxRetries times, honouring the Retry-After header and
     falling back to -RetryAfterSeconds when the service does not send one.
 .EXAMPLE
-    .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv -WhatIf
+    .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv `
+                              -ItemTypeCsvPath .\fabric_item_types.csv -WhatIf
 .EXAMPLE
-    .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv -Confirm:$false
+    .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv `
+                              -ItemTypeCsvPath .\fabric_item_types.csv -AllowReplace -Confirm:$false
 .EXAMPLE
     # Only two capacities, leave everything inactive
     .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv `
+                              -ItemTypeCsvPath .\fabric_item_types.csv `
                               -CapacityId <cap1>,<cap2> -SkipActivate -Confirm:$false
 #>
 [CmdletBinding(SupportsShouldProcess)]
@@ -45,11 +62,23 @@ param(
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
     [string]$CsvPath,
 
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
+    [string]$ItemTypeCsvPath,
+
     [guid[]]$CapacityId,
 
     [string]$NamePrefix = 'pol_',
 
-    [string]$RestrictedItemType = 'Notebook',
+    # Workspace the deny-all rule points at so that it never matches. Must not be a real workspace.
+    [guid]$DenyAllSentinelWorkspaceId = '00000000-0000-0000-0000-000000000000',
+
+    # Values allowed in one workspace.id condition; longer whitelists are split over several rules.
+    [ValidateRange(1, 49)]
+    [int]$MaxWorkspacesPerRule = 49,
+
+    [ValidateRange(1, 50)]
+    [int]$MaxRulesPerPolicy = 50,
 
     [ValidateSet('ExternalDataSharing', 'ItemCreation')]
     [string]$Policy = 'ItemCreation',
@@ -206,6 +235,27 @@ foreach ($row in $rows) {
 Write-Verbose "CSV mapped $($workspacesByCapacity.Count) capacity(ies) to workspaces."
 
 # ---------------------------------------------------------------------------
+# CSV - allowed item types
+# ---------------------------------------------------------------------------
+
+$itemTypeRows = @(Import-Csv -LiteralPath $ItemTypeCsvPath)
+if ($itemTypeRows.Count -eq 0) { throw "CSV '$ItemTypeCsvPath' is empty." }
+
+if ($itemTypeRows[0].PSObject.Properties.Name -notcontains 'item_type') {
+    throw "CSV '$ItemTypeCsvPath' is missing the 'item_type' column. Found: $($itemTypeRows[0].PSObject.Properties.Name -join ', ')."
+}
+
+$allowedItemTypes = @(
+    $itemTypeRows |
+        ForEach-Object { "$($_.item_type)".Trim() } |
+        Where-Object { $_ } |
+        Select-Object -Unique
+)
+
+if ($allowedItemTypes.Count -eq 0) { throw "CSV '$ItemTypeCsvPath' contains no item types." }
+Write-Verbose "Allowing $($allowedItemTypes.Count) item type(s): $($allowedItemTypes -join ', ')"
+
+# ---------------------------------------------------------------------------
 # Capacities
 # ---------------------------------------------------------------------------
 
@@ -298,29 +348,53 @@ foreach ($capacity in $capacities) {
         }
 
         # 2) Replace the rules for this policy.
+        # There is no Deny effect, so "deny all" is an Allow rule that can never match: it keeps the
+        # policy in force without granting anything.
         $rules = @(
             @{
-                displayName = "All items except $RestrictedItemType"
-                description = "Allow every item type other than $RestrictedItemType"
-                conditions  = @(New-DynamicCondition -TargetProperty 'item.type' -Operator 'NoneOf' -Values $RestrictedItemType)
+                displayName = 'Deny all item creation'
+                description = 'Baseline - grants nothing, so only the rules below can allow creation'
+                conditions  = @(New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $DenyAllSentinelWorkspaceId.ToString())
                 effects     = @(@{ type = 'Allow' })
             }
         )
 
         $approved = $workspacesByCapacity[$capacity.id]
         if ($approved -and $approved.Count -gt 0) {
-            $rules += @{
-                displayName = "$RestrictedItemType in approved workspaces"
-                description = "Allow $RestrictedItemType creation in $($approved.Count) approved workspace(s)"
-                conditions  = @(
-                    (New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $approved.ToArray()),
-                    (New-DynamicCondition -TargetProperty 'item.type' -Operator 'AnyOf' -Values $RestrictedItemType)
-                )
-                effects     = @(@{ type = 'Allow' })
+            # A single workspace.id condition holds at most -MaxWorkspacesPerRule values, so long
+            # whitelists are spread over several otherwise identical rules.
+            $batches = @()
+            for ($start = 0; $start -lt $approved.Count; $start += $MaxWorkspacesPerRule) {
+                $end = [Math]::Min($start + $MaxWorkspacesPerRule, $approved.Count) - 1
+                $batches += , @($approved[$start..$end])
+            }
+
+            $batchNumber = 0
+            foreach ($batch in $batches) {
+                $batchNumber++
+                $suffix = if ($batches.Count -gt 1) { " ($batchNumber/$($batches.Count))" } else { '' }
+
+                $rules += @{
+                    displayName = "Approved item types in whitelisted workspaces$suffix"
+                    description = "Allow $($allowedItemTypes.Count) item type(s) in $($batch.Count) whitelisted workspace(s)"
+                    conditions  = @(
+                        (New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $batch),
+                        (New-DynamicCondition -TargetProperty 'item.type' -Operator 'AnyOf' -Values $allowedItemTypes)
+                    )
+                    effects     = @(@{ type = 'Allow' })
+                }
+            }
+
+            if ($batches.Count -gt 1) {
+                Write-Host "$($approved.Count) whitelisted workspace(s) split across $($batches.Count) rules." -ForegroundColor DarkGray
             }
         }
         else {
-            Write-Warning "No workspaces in the CSV for capacity $($capacity.id); rule 2 omitted, so $RestrictedItemType creation is blocked capacity-wide."
+            Write-Warning "No workspaces in the CSV for capacity $($capacity.id); deny-all only, so no governed item type can be created on it."
+        }
+
+        if ($rules.Count -gt $MaxRulesPerPolicy) {
+            throw "$($rules.Count) rules exceed the $MaxRulesPerPolicy-rule limit for policy '$Policy'. Reduce the whitelist for capacity $($capacity.id) or raise -MaxWorkspacesPerRule."
         }
 
         $result.rules = $rules.Count

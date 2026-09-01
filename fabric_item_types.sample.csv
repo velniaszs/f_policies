@@ -1,0 +1,24 @@
+item_name,item_type
+Lakehouse,Lakehouse
+Warehouse,Warehouse
+Eventhouse,Eventhouse
+Notebook,Notebook
+Spark Job Definition,SparkJobDefinition
+Data Flows Gen2 (with and without CICD),Dataflow
+SqlAnalyticsEndpoint,SQLEndpoint
+Pipeline,DataPipeline
+Copy Job,CopyJob
+Mirrored Azure SQL Database,MirroredDatabase
+Mirrored Snowflake,MirroredDatabase
+Mirrored Database,MirroredDatabase
+Mirrored Azure Cosmos DB,MirroredDatabase
+Mirrored Azure SQL Managed Instance,MirroredDatabase
+Mirrored Azure Database for PostgreSQL,MirroredDatabase
+Mirrored SQL Server,MirroredDatabase
+Mirrored Oracle,MirroredDatabase
+Mirrored SAP,MirroredDatabase
+Variable Library,VariableLibrary
+Environment,Environment
+Graph queryset,GraphQuerySet
+Graph model,GraphModel
+KQL Query,KQLQueryset

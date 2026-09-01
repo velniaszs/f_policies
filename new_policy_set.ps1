@@ -222,6 +222,10 @@ if (-not $operationId) {
 }
 
 $operationUri = "https://api.fabric.microsoft.com/v1/operations/$operationId"
+
+# Seeded so a 429 on the first poll can 'continue' without tripping strict mode on $operation.
+$operation = [pscustomobject]@{ status = 'Running' }
+
 do {
     Start-Sleep -Seconds ([int]$retryAfter)
 
@@ -231,6 +235,29 @@ do {
         $operation = Invoke-RestMethod -Uri $operationUri -Method Get -Headers $headers -ErrorAction Stop
     }
     catch {
+        $status = 0
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+
+        # The policy set is already being created, so a throttled poll must back off here rather than
+        # bubble up - a caller retrying the whole script would POST a second time.
+        if ($status -eq 429) {
+            $retryAfter = 30
+            try {
+                $throttleHeaders = $_.Exception.Response.Headers
+                if ($throttleHeaders -is [System.Net.WebHeaderCollection]) {
+                    $value = $throttleHeaders['Retry-After']
+                }
+                else {
+                    $value = $throttleHeaders.GetValues('Retry-After') | Select-Object -First 1
+                }
+                if ($value) { $retryAfter = [int]$value }
+            }
+            catch { }
+
+            Write-Warning "429 while polling operation $operationId. Waiting $retryAfter s."
+            continue
+        }
+
         Write-Host (Get-FabricErrorText -ErrorRecord $_) -ForegroundColor Red
         throw
     }
