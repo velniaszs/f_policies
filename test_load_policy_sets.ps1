@@ -370,7 +370,7 @@ for ($i = 1; $i -le $Count; $i++) {
 
                 $rules += @{
                     displayName = Get-RuleDisplayName -BaseName 'Approved Fabric item types for whitelisted workspaces' -Suffix $suffix
-                    description = "Allow $($allowedItemTypes.Count) item type(s) in $($batch.Count) workspace(s)"
+                    description = "Allow $($allowedItemTypes.Count) Fabric item type(s) in $($batch.Count) whitelisted Fabric workspace(s). Power BI items are not governed by this policy."
                     conditions  = @(
                         (New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $batch),
                         (New-DynamicCondition -TargetProperty 'item.type' -Operator 'AnyOf' -Values $allowedItemTypes)
