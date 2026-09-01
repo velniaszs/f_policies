@@ -68,8 +68,26 @@ Or one at a time:
 
 ## Rollback
 
+Deactivate one policy set:
+
 ```powershell
 .\deactivate_policy_set.ps1 -WorkspaceId <ws> -PolicySetId <ps>
+```
+
+Drop everything the migration created (preview first):
+
+```powershell
+$ws = '<workspace-id>'
+
+# preview
+.\list_policy_sets.ps1 -WorkspaceId $ws |
+    Where-Object { $_.displayName -like 'pol_*' } |
+    Format-Table displayName, id, status
+
+# delete (deactivates first where needed)
+.\list_policy_sets.ps1 -WorkspaceId $ws |
+    Where-Object { $_.displayName -like 'pol_*' } |
+    ForEach-Object { .\remove_policy_set.ps1 -WorkspaceId $ws -PolicySetId $_.id -Deactivate -Confirm:$false }
 ```
 
 ## Notes
