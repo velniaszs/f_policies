@@ -1,0 +1,383 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Rolls out one capacity-scoped policy set per capacity, with the standard item-creation rules.
+.DESCRIPTION
+    For every capacity the caller administers:
+
+      1. Ensure a policy set named "<NamePrefix><capacityDisplayName>" exists in -WorkspaceId,
+         scoped to that capacity (created when missing, reused when already there).
+      2. Replace the ItemCreation rules of that policy set with:
+           Rule 1 - item.type NoneOf [<RestrictedItemType>]
+                    every other item type stays allowed on the capacity.
+           Rule 2 - item.type AnyOf [<RestrictedItemType>] AND workspace.id AnyOf [<csv workspaces>]
+                    only added when the CSV lists workspaces for the capacity.
+      3. Activate the policy set on the capacity.
+
+    Rules are written with POST .../policyRules/replaceByPolicy, which overwrites all rules of the
+    given policy. That makes re-runs idempotent: the script can be used both to create and to update.
+
+    The CSV lists the workspaces whitelisted for <RestrictedItemType> creation and needs the columns:
+
+        capacity_id,workspace_id
+
+    One row per capacity/workspace pair; capacities absent from the file get rule 1 only, which leaves
+    <RestrictedItemType> creation blocked across the whole capacity.
+    See fabric_workspaces.sample.csv for the expected shape.
+
+    HTTP 429 responses are retried up to -MaxRetries times, honouring the Retry-After header and
+    falling back to -RetryAfterSeconds when the service does not send one.
+.EXAMPLE
+    .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv -WhatIf
+.EXAMPLE
+    .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv -Confirm:$false
+.EXAMPLE
+    # Only two capacities, leave everything inactive
+    .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv `
+                              -CapacityId <cap1>,<cap2> -SkipActivate -Confirm:$false
+#>
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    # Workspace that holds the policy set items.
+    [Parameter(Mandatory)][guid]$WorkspaceId,
+
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
+    [string]$CsvPath,
+
+    [guid[]]$CapacityId,
+
+    [string]$NamePrefix = 'pol_',
+
+    [string]$RestrictedItemType = 'Notebook',
+
+    [ValidateSet('ExternalDataSharing', 'ItemCreation')]
+    [string]$Policy = 'ItemCreation',
+
+    # Enumerate every capacity in the tenant (Power BI admin API) instead of just the caller's own.
+    [switch]$AsAdmin,
+
+    [switch]$IncludeInactiveCapacities,
+
+    [switch]$SkipActivate,
+
+    # Take the capacity over from whichever policy set is currently active on it.
+    [switch]$AllowReplace,
+
+    [int]$MaxRetries = 5,
+
+    [int]$RetryAfterSeconds = 30,
+
+    [string]$TenantId,
+    [string]$ClientId,
+    [securestring]$ClientSecret
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'FabricPolicies.Common.ps1')
+Initialize-FabricAuth -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
+
+$auth = @{}
+if ($TenantId)     { $auth.TenantId = $TenantId }
+if ($ClientId)     { $auth.ClientId = $ClientId }
+if ($ClientSecret) { $auth.ClientSecret = $ClientSecret }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+function Get-HttpStatusCode {
+    param($ErrorRecord)
+    try { return [int]$ErrorRecord.Exception.Response.StatusCode } catch { return 0 }
+}
+
+function Get-ErrorBodyCode {
+    param($ErrorRecord)
+
+    $text = $null
+    try { $text = $ErrorRecord.ErrorDetails.Message } catch { }
+    if (-not $text) {
+        try {
+            $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+            $stream.Position = 0
+            $text = (New-Object System.IO.StreamReader($stream)).ReadToEnd()
+        }
+        catch { }
+    }
+    if (-not $text) { return $null }
+
+    try { return ($text | ConvertFrom-Json).errorCode } catch { return $null }
+}
+
+function Get-RetryAfterSeconds {
+    param($ErrorRecord, [int]$Default)
+
+    try {
+        $headers = $ErrorRecord.Exception.Response.Headers
+        if ($headers -is [System.Net.WebHeaderCollection]) {
+            $value = $headers['Retry-After']
+        }
+        else {
+            $value = $headers.GetValues('Retry-After') | Select-Object -First 1
+        }
+        if ($value) { return [int]$value }
+    }
+    catch { }
+
+    $Default
+}
+
+function Invoke-WithRetry {
+    <#
+        Runs $Action, retrying only on HTTP 429 so genuine failures still surface immediately.
+    #>
+    param(
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $attempt = 0
+    while ($true) {
+        try {
+            return & $Action
+        }
+        catch {
+            if ((Get-HttpStatusCode -ErrorRecord $_) -ne 429 -or $attempt -ge $MaxRetries) { throw }
+
+            $attempt++
+            $wait = Get-RetryAfterSeconds -ErrorRecord $_ -Default $RetryAfterSeconds
+            Write-Warning "429 Too Many Requests on $Description. Waiting $wait s (retry $attempt/$MaxRetries)."
+            Start-Sleep -Seconds $wait
+        }
+    }
+}
+
+function New-DynamicCondition {
+    param(
+        [Parameter(Mandatory)][string]$TargetProperty,
+        [Parameter(Mandatory)][string]$Operator,
+        [Parameter(Mandatory)][string[]]$Values
+    )
+
+    @{
+        type           = 'Dynamic'
+        targetProperty = $TargetProperty
+        predicate      = @{ operator = $Operator; values = @($Values) }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# CSV - capacity_id -> workspace_id[]
+# ---------------------------------------------------------------------------
+
+$rows = @(Import-Csv -LiteralPath $CsvPath)
+if ($rows.Count -eq 0) { throw "CSV '$CsvPath' is empty." }
+
+$columns = $rows[0].PSObject.Properties.Name
+foreach ($required in 'capacity_id', 'workspace_id') {
+    if ($columns -notcontains $required) {
+        throw "CSV '$CsvPath' is missing the '$required' column. Found: $($columns -join ', ')."
+    }
+}
+
+$workspacesByCapacity = @{}   # PowerShell hashtables are case-insensitive, so GUID casing does not matter.
+$rowNumber = 1
+foreach ($row in $rows) {
+    $rowNumber++
+    $capacityKey = "$($row.capacity_id)".Trim()
+    $workspaceKey = "$($row.workspace_id)".Trim()
+    if (-not $capacityKey -and -not $workspaceKey) { continue }
+
+    $parsed = [guid]::Empty
+    if (-not [guid]::TryParse($capacityKey, [ref]$parsed) -or -not [guid]::TryParse($workspaceKey, [ref]$parsed)) {
+        Write-Warning "Row $rowNumber of $CsvPath skipped: '$capacityKey' / '$workspaceKey' is not a GUID pair."
+        continue
+    }
+
+    if (-not $workspacesByCapacity.ContainsKey($capacityKey)) {
+        $workspacesByCapacity[$capacityKey] = New-Object System.Collections.Generic.List[string]
+    }
+    if (-not $workspacesByCapacity[$capacityKey].Contains($workspaceKey)) {
+        $workspacesByCapacity[$capacityKey].Add($workspaceKey)
+    }
+}
+
+Write-Verbose "CSV mapped $($workspacesByCapacity.Count) capacity(ies) to workspaces."
+
+# ---------------------------------------------------------------------------
+# Capacities
+# ---------------------------------------------------------------------------
+
+$listArgs = @{}
+if ($AsAdmin) { $listArgs.AsAdmin = $true }
+
+$capacities = @(Invoke-WithRetry -Description 'list capacities' -Action {
+    & (Join-Path $PSScriptRoot 'list_capacities.ps1') @auth @listArgs
+})
+
+# Only the admin route reports the caller's access right; the core route already returns
+# just the capacities the principal administers or contributes to.
+$capacities = @($capacities | Where-Object {
+    -not ($_.PSObject.Properties.Name -contains 'capacityUserAccessRight') -or $_.capacityUserAccessRight -eq 'Admin'
+})
+
+if (-not $IncludeInactiveCapacities) {
+    $capacities = @($capacities | Where-Object { $_.state -eq 'Active' })
+}
+
+if ($CapacityId) {
+    $wanted = @($CapacityId | ForEach-Object { $_.ToString() })
+    $capacities = @($capacities | Where-Object { $wanted -contains $_.id })
+}
+
+if ($capacities.Count -eq 0) { throw 'No matching capacities found for this principal.' }
+Write-Host "Processing $($capacities.Count) capacity(ies) into workspace $WorkspaceId." -ForegroundColor Cyan
+
+# ---------------------------------------------------------------------------
+# Existing policy sets in the target workspace, indexed by display name
+# ---------------------------------------------------------------------------
+
+$existing = @{}
+foreach ($set in @(Invoke-WithRetry -Description 'list policy sets' -Action {
+        & (Join-Path $PSScriptRoot 'list_policy_sets.ps1') @auth -WorkspaceId $WorkspaceId
+    })) {
+    $existing[$set.displayName] = $set
+}
+
+# ---------------------------------------------------------------------------
+# Per capacity
+# ---------------------------------------------------------------------------
+
+$results = @()
+
+foreach ($capacity in $capacities) {
+    $name = "$NamePrefix$($capacity.displayName)"
+    $result = [pscustomobject]@{
+        capacityId   = $capacity.id
+        capacityName = $capacity.displayName
+        policySetName = $name
+        policySetId  = $null
+        action       = 'Skipped'
+        rules        = 0
+        activated    = $false
+        error        = $null
+    }
+
+    Write-Host ''
+    Write-Host ("--- {0} ({1})" -f $capacity.displayName, $capacity.id) -ForegroundColor Cyan
+
+    try {
+        # 1) Create or reuse the policy set.
+        $policySet = $existing[$name]
+
+        if ($policySet) {
+            if ($policySet.scopeType -ne 'Capacity' -or $policySet.scopeId -ne $capacity.id) {
+                throw "Existing policy set '$name' ($($policySet.id)) is scoped to $($policySet.scopeType)/$($policySet.scopeId); scope cannot be changed. Rename or delete it first."
+            }
+            $result.policySetId = $policySet.id
+            $result.action = 'Updated'
+            Write-Host "Reusing policy set $($policySet.id)." -ForegroundColor DarkGray
+        }
+        elseif ($PSCmdlet.ShouldProcess("workspace $WorkspaceId", "Create policy set '$name' on capacity $($capacity.id)")) {
+            $created = Invoke-WithRetry -Description "create policy set '$name'" -Action {
+                & (Join-Path $PSScriptRoot 'new_policy_set.ps1') @auth `
+                    -WorkspaceId $WorkspaceId `
+                    -CapacityId $capacity.id `
+                    -DisplayName $name `
+                    -Description "Item creation policy for capacity $($capacity.displayName)" `
+                    -Confirm:$false
+            }
+            $result.policySetId = $created.id
+            $result.action = 'Created'
+            Write-Host "Created policy set $($created.id)." -ForegroundColor Green
+        }
+        else {
+            $results += $result
+            continue
+        }
+
+        # 2) Replace the rules for this policy.
+        $rules = @(
+            @{
+                displayName = "All items except $RestrictedItemType"
+                description = "Allow every item type other than $RestrictedItemType"
+                conditions  = @(New-DynamicCondition -TargetProperty 'item.type' -Operator 'NoneOf' -Values $RestrictedItemType)
+                effects     = @(@{ type = 'Allow' })
+            }
+        )
+
+        $approved = $workspacesByCapacity[$capacity.id]
+        if ($approved -and $approved.Count -gt 0) {
+            $rules += @{
+                displayName = "$RestrictedItemType in approved workspaces"
+                description = "Allow $RestrictedItemType creation in $($approved.Count) approved workspace(s)"
+                conditions  = @(
+                    (New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $approved.ToArray()),
+                    (New-DynamicCondition -TargetProperty 'item.type' -Operator 'AnyOf' -Values $RestrictedItemType)
+                )
+                effects     = @(@{ type = 'Allow' })
+            }
+        }
+        else {
+            Write-Warning "No workspaces in the CSV for capacity $($capacity.id); rule 2 omitted, so $RestrictedItemType creation is blocked capacity-wide."
+        }
+
+        $result.rules = $rules.Count
+        $body = @{ policy = $Policy; policyRules = @($rules) } | ConvertTo-Json -Depth 12
+
+        if ($PSCmdlet.ShouldProcess("policy set $($result.policySetId)", "Replace $Policy rules with $($rules.Count) rule(s)")) {
+            $uri = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId/policySets/$($result.policySetId)/policyRules/replaceByPolicy"
+            Write-Verbose "POST $uri"
+            Write-Verbose $body
+
+            Invoke-WithRetry -Description "replace $Policy rules" -Action {
+                $headers = @{ Authorization = "Bearer $(Get-FabricToken)" }
+                Invoke-RestMethod -Uri $uri -Method Post -Headers $headers `
+                    -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
+                    -ContentType 'application/json; charset=utf-8' -ErrorAction Stop
+            } | Out-Null
+
+            Write-Host "Applied $($rules.Count) $Policy rule(s)." -ForegroundColor Green
+        }
+
+        # 3) Activate on the capacity.
+        if (-not $SkipActivate) {
+            try {
+                Invoke-WithRetry -Description "activate policy set $($result.policySetId)" -Action {
+                    & (Join-Path $PSScriptRoot 'activate_policy_set.ps1') @auth `
+                        -WorkspaceId $WorkspaceId `
+                        -PolicySetId $result.policySetId `
+                        -AllowReplace:$AllowReplace `
+                        -Confirm:$false
+                }
+                $result.activated = -not $WhatIfPreference
+            }
+            catch {
+                if ((Get-ErrorBodyCode -ErrorRecord $_) -eq 'PolicySetIsAlreadyActive') {
+                    Write-Host 'Already active.' -ForegroundColor DarkGray
+                    $result.activated = $true
+                }
+                else { throw }
+            }
+        }
+    }
+    catch {
+        $result.error = (Get-FabricErrorText -ErrorRecord $_)
+        Write-Host $result.error -ForegroundColor Red
+    }
+
+    $results += $result
+}
+
+Write-Host ''
+Write-Host '=== Summary ===' -ForegroundColor Cyan
+$results | Format-Table capacityName, policySetName, policySetId, action, rules, activated -AutoSize | Out-Host
+
+$failed = @($results | Where-Object { $_.error })
+if ($failed.Count -gt 0) {
+    Write-Host "$($failed.Count) capacity(ies) failed:" -ForegroundColor Red
+    $failed | ForEach-Object { Write-Host " - $($_.capacityName): $($_.error)" -ForegroundColor Red }
+}
+
+$results
