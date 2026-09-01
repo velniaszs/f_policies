@@ -192,6 +192,18 @@ function Get-Percentile {
     $sorted[$index]
 }
 
+function Get-RuleDisplayName {
+    # Policy rule display names are capped at 60 characters by the service.
+    param(
+        [Parameter(Mandatory)][string]$BaseName,
+        [string]$Suffix = '',
+        [int]$MaxLength = 60
+    )
+
+    if (($BaseName.Length + $Suffix.Length) -le $MaxLength) { return "$BaseName$Suffix" }
+    $BaseName.Substring(0, $MaxLength - $Suffix.Length).TrimEnd() + $Suffix
+}
+
 # ---------------------------------------------------------------------------
 # Cleanup mode
 # ---------------------------------------------------------------------------
@@ -337,7 +349,7 @@ for ($i = 1; $i -le $Count; $i++) {
         # Build the rules first so a limit breach fails before anything is created.
         $rules = @(
             @{
-                displayName = 'Deny all item creation (allows PBI items since not tracked in policies)'
+                displayName = Get-RuleDisplayName -BaseName 'Deny all item creation (PBI items not tracked)'
                 description = 'Baseline - grants nothing'
                 conditions  = @(New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $DenyAllSentinelWorkspaceId.ToString())
                 effects     = @(@{ type = 'Allow' })
@@ -357,7 +369,7 @@ for ($i = 1; $i -le $Count; $i++) {
                 $suffix = if ($batches.Count -gt 1) { " ($batchNumber/$($batches.Count))" } else { '' }
 
                 $rules += @{
-                    displayName = "Approved item types for whitelisted workspaces (fabric work)$suffix"
+                    displayName = Get-RuleDisplayName -BaseName 'Approved Fabric item types for whitelisted workspaces' -Suffix $suffix
                     description = "Allow $($allowedItemTypes.Count) item type(s) in $($batch.Count) workspace(s)"
                     conditions  = @(
                         (New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $batch),
