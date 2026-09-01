@@ -197,9 +197,9 @@ function Get-Percentile {
 # ---------------------------------------------------------------------------
 
 if ($Cleanup) {
-    $sets = @(Invoke-WithRetry -Description 'list policy sets' -Action {
+    $sets = @(@(Invoke-WithRetry -Description 'list policy sets' -Action {
         & (Join-Path $PSScriptRoot 'list_policy_sets.ps1') @auth -WorkspaceId $WorkspaceId
-    }) | Where-Object { $_.displayName -like "$NamePrefix*" }
+    }) | Where-Object { $_.displayName -like "$NamePrefix*" })
 
     if ($sets.Count -eq 0) {
         Write-Host "Nothing to clean up: no policy set in $WorkspaceId starts with '$NamePrefix'." -ForegroundColor Yellow
@@ -209,20 +209,34 @@ if ($Cleanup) {
     Write-Host "Deleting $($sets.Count) policy set(s) named '$NamePrefix*' from workspace $WorkspaceId." -ForegroundColor Cyan
 
     $deleted = 0
+    $index = 0
+    $cleanupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
     foreach ($set in $sets) {
+        $index++
+        $deleteStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         try {
             Invoke-WithRetry -Description "delete $($set.id)" -Action {
                 & (Join-Path $PSScriptRoot 'remove_policy_set.ps1') @auth `
                     -WorkspaceId $WorkspaceId -PolicySetId $set.id -Deactivate -Confirm:$false
             }
+            $deleteStopwatch.Stop()
             $deleted++
+
+            Write-Host ("[{0}/{1}] {2,-20} {3}  deleted in {4,6} ms" -f `
+                $index, $sets.Count, $set.displayName, $set.id, $deleteStopwatch.ElapsedMilliseconds) -ForegroundColor DarkGray
         }
         catch {
-            Write-Host "Failed to delete $($set.displayName): $(Get-FabricErrorText -ErrorRecord $_)" -ForegroundColor Red
+            $deleteStopwatch.Stop()
+            Write-Host ("[{0}/{1}] {2,-20} {3}  FAILED: {4}" -f `
+                $index, $sets.Count, $set.displayName, $set.id, (Get-FabricErrorText -ErrorRecord $_)) -ForegroundColor Red
         }
     }
 
-    Write-Host "Deleted $deleted of $($sets.Count)." -ForegroundColor Green
+    $cleanupStopwatch.Stop()
+    Write-Host ''
+    Write-Host ("Deleted {0} of {1} in {2:n1} s ({3} HTTP 429 retries)." -f `
+        $deleted, $sets.Count, $cleanupStopwatch.Elapsed.TotalSeconds, $script:ThrottleCount) -ForegroundColor Green
     return
 }
 
