@@ -400,9 +400,29 @@ foreach ($capacity in $capacities) {
         $policySet = $existing[$name]
 
         if ($policySet) {
-            if ($policySet.scopeType -ne 'Capacity' -or $policySet.scopeId -ne $capacity.id) {
-                throw "Existing policy set '$name' ($($policySet.id)) is scoped to $($policySet.scopeType)/$($policySet.scopeId); scope cannot be changed. Rename or delete it first."
+            if ($policySet.scopeType -ne 'Capacity') {
+                throw "Existing policy set '$name' ($($policySet.id)) is scoped to $($policySet.scopeType), not Capacity; scope cannot be changed. Rename or delete it first."
             }
+
+            # The list response often omits scope.id, so confirm with a direct GET before calling it a mismatch.
+            $scopeId = $policySet.scopeId
+            if (-not $scopeId) {
+                $fetched = Invoke-WithRetry -Description "get policy set $($policySet.id)" -Action {
+                    & (Join-Path $PSScriptRoot 'get_policy_set.ps1') @auth `
+                        -WorkspaceId $WorkspaceId -PolicySetId $policySet.id
+                }
+                if ($fetched.properties.scope.PSObject.Properties.Name -contains 'id') {
+                    $scopeId = $fetched.properties.scope.id
+                }
+            }
+
+            if ($scopeId -and $scopeId -ne $capacity.id) {
+                throw "Existing policy set '$name' ($($policySet.id)) is scoped to capacity $scopeId, not $($capacity.id); scope cannot be changed. Rename or delete it first."
+            }
+            if (-not $scopeId) {
+                Write-Verbose "Policy set $($policySet.id) reports no capacity id; assuming it targets $($capacity.id)."
+            }
+
             $result.policySetId = $policySet.id
             $result.action = 'Updated'
             Write-Host "Reusing policy set $($policySet.id)." -ForegroundColor DarkGray
@@ -530,7 +550,11 @@ foreach ($capacity in $capacities) {
         $result.totalMs = $result.createMs + $result.rulesMs + $result.activateMs
     }
     catch {
-        $result.error = (Get-FabricErrorText -ErrorRecord $_)
+        # Only HTTP failures get the API error formatting; local validation errors keep their own text.
+        $hasResponse = $false
+        try { $hasResponse = $null -ne $_.Exception.Response } catch { }
+
+        $result.error = if ($hasResponse) { Get-FabricErrorText -ErrorRecord $_ } else { $_.Exception.Message }
         Write-Host $result.error -ForegroundColor Red
     }
 
