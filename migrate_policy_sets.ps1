@@ -37,7 +37,7 @@
 
         item_name,item_type
 
-    See fabric_item_types.sample.csv for the expected shape.
+    See fabric_item_types.csv for the expected shape.
 
     HTTP 429 responses are retried up to -MaxRetries times, honouring the Retry-After header and
     falling back to -RetryAfterSeconds when the service does not send one.

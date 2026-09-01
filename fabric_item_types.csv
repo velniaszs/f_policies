@@ -5,7 +5,6 @@ Eventhouse,Eventhouse
 Notebook,Notebook
 Spark Job Definition,SparkJobDefinition
 Data Flows Gen2 (with and without CICD),Dataflow
-SqlAnalyticsEndpoint,SQLEndpoint
 Pipeline,DataPipeline
 Copy Job,CopyJob
 Mirrored Azure SQL Database,MirroredDatabase
