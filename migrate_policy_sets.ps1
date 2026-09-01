@@ -209,6 +209,24 @@ function Get-Percentile {
     $sorted[$index]
 }
 
+function ConvertTo-ItemDisplayName {
+    <#
+        Capacity display names are far more permissive than Fabric item display names, so strip the
+        characters items reject and cap the length. Fabric silently rejects trailing dots/spaces too.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Name,
+        [int]$MaxLength = 256
+    )
+
+    $clean = $Name -replace '[\\/:*?"<>|]', '_'
+    $clean = $clean -replace '[\x00-\x1F\x7F]', ''
+    $clean = $clean.Trim()
+    if ($clean.Length -gt $MaxLength) { $clean = $clean.Substring(0, $MaxLength) }
+    $clean = $clean -replace '[\s.]+$', ''
+    $clean
+}
+
 # ---------------------------------------------------------------------------
 # CSV - capacity_id -> workspace_id[]
 # ---------------------------------------------------------------------------
@@ -298,6 +316,32 @@ if ($capacities.Count -eq 0) { throw 'No matching capacities found for this prin
 Write-Host "Processing $($capacities.Count) capacity(ies) into workspace $WorkspaceId." -ForegroundColor Cyan
 
 # ---------------------------------------------------------------------------
+# Policy set names
+# ---------------------------------------------------------------------------
+
+# Two capacities can share a display name, which would collide into one policy set name and make the
+# name-based lookup below match the wrong capacity, so resolve every name up front.
+$policySetNames = @{}
+$nameUsage = @{}
+
+foreach ($capacity in $capacities) {
+    $raw = "$NamePrefix$($capacity.displayName)"
+    $name = ConvertTo-ItemDisplayName -Name $raw
+
+    if (-not $name) { throw "Capacity $($capacity.id) produced an empty policy set name from display name '$($capacity.displayName)'." }
+    if ($name -ne $raw) { Write-Warning "Capacity $($capacity.id): name '$raw' sanitised to '$name'." }
+
+    if ($nameUsage.ContainsKey($name)) {
+        $suffix = " ($($capacity.id.ToString().Substring(0, 8)))"
+        $name = (ConvertTo-ItemDisplayName -Name $name -MaxLength (256 - $suffix.Length)) + $suffix
+        Write-Warning "Duplicate capacity display name '$($capacity.displayName)'; using '$name' for capacity $($capacity.id)."
+    }
+
+    $nameUsage[$name] = $true
+    $policySetNames[$capacity.id] = $name
+}
+
+# ---------------------------------------------------------------------------
 # Existing policy sets in the target workspace, indexed by display name
 # ---------------------------------------------------------------------------
 
@@ -318,7 +362,7 @@ $runStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 foreach ($capacity in $capacities) {
     $index++
-    $name = "$NamePrefix$($capacity.displayName)"
+    $name = $policySetNames[$capacity.id]
     $result = [pscustomobject]@{
         capacityId   = $capacity.id
         capacityName = $capacity.displayName
