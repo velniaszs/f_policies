@@ -337,7 +337,7 @@ for ($i = 1; $i -le $Count; $i++) {
         # Build the rules first so a limit breach fails before anything is created.
         $rules = @(
             @{
-                displayName = 'Deny all item creation'
+                displayName = 'Deny all item creation (allows PBI items since not tracked in policies)'
                 description = 'Baseline - grants nothing'
                 conditions  = @(New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $DenyAllSentinelWorkspaceId.ToString())
                 effects     = @(@{ type = 'Allow' })
@@ -357,7 +357,7 @@ for ($i = 1; $i -le $Count; $i++) {
                 $suffix = if ($batches.Count -gt 1) { " ($batchNumber/$($batches.Count))" } else { '' }
 
                 $rules += @{
-                    displayName = "Approved item types in whitelisted workspaces$suffix"
+                    displayName = "Approved item types for whitelisted workspaces (fabric work)$suffix"
                     description = "Allow $($allowedItemTypes.Count) item type(s) in $($batch.Count) workspace(s)"
                     conditions  = @(
                         (New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $batch),

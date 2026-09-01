@@ -434,7 +434,7 @@ foreach ($capacity in $capacities) {
         # policy in force without granting anything.
         $rules = @(
             @{
-                displayName = 'Deny all item creation'
+                displayName = 'Deny all item creation (allows PBI items since not tracked in policies)'
                 description = 'Baseline - grants nothing, so only the rules below can allow creation'
                 conditions  = @(New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $DenyAllSentinelWorkspaceId.ToString())
                 effects     = @(@{ type = 'Allow' })
@@ -458,7 +458,7 @@ foreach ($capacity in $capacities) {
                 $suffix = if ($batches.Count -gt 1) { " ($batchNumber/$($batches.Count))" } else { '' }
 
                 $rules += @{
-                    displayName = "Approved item types in whitelisted workspaces$suffix"
+                    displayName = "Approved item types for whitelisted workspaces (fabric work)$suffix"
                     description = "Allow $($allowedItemTypes.Count) item type(s) in $($batch.Count) whitelisted workspace(s)"
                     conditions  = @(
                         (New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $batch),
