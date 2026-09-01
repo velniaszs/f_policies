@@ -74,6 +74,7 @@ Or one at a time:
 
 ## Notes
 
+- Only Fabric (`F*` SKU) capacities are processed. Power BI SKUs (`P`/`A`/`EM`/`PP`) are reported as skipped and ignored.
 - `-AllowReplace` is needed if another policy set is already active on a capacity, otherwise you get `PolicySetActivationConflict`.
 - A capacity **missing from the CSV** gets the deny-all rule only, blocking all governed item creation once activated. Check the warnings from step 3 before activating.
 - Re-runs are safe: existing sets are reused (`action = Updated`) and rules are overwritten, not duplicated.

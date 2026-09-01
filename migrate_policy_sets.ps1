@@ -3,7 +3,7 @@
 .SYNOPSIS
     Rolls out one capacity-scoped policy set per capacity, with the standard item-creation rules.
 .DESCRIPTION
-    For every capacity the caller administers:
+    For every Fabric (F SKU) capacity the caller administers:
 
       1. Ensure a policy set named "<NamePrefix><capacityDisplayName>" exists in -WorkspaceId,
          scoped to that capacity (created when missing, reused when already there).
@@ -87,6 +87,9 @@ param(
     [switch]$AsAdmin,
 
     [switch]$IncludeInactiveCapacities,
+
+    # Only Fabric capacities can host a policy set. Set to '' to disable the SKU filter.
+    [string]$CapacitySkuPattern = 'F*',
 
     [switch]$SkipActivate,
 
@@ -305,6 +308,16 @@ $capacities = @($capacities | Where-Object {
 
 if (-not $IncludeInactiveCapacities) {
     $capacities = @($capacities | Where-Object { $_.state -eq 'Active' })
+}
+
+# Policy sets can only be scoped to Fabric capacities, so drop Power BI SKUs (P/A/EM/PP).
+if ($CapacitySkuPattern) {
+    $skipped = @($capacities | Where-Object { $_.sku -notlike $CapacitySkuPattern })
+    if ($skipped.Count -gt 0) {
+        Write-Host ("Skipping {0} non-Fabric capacity(ies): {1}" -f `
+            $skipped.Count, (($skipped | ForEach-Object { "$($_.displayName) [$($_.sku)]" }) -join ', ')) -ForegroundColor Yellow
+    }
+    $capacities = @($capacities | Where-Object { $_.sku -like $CapacitySkuPattern })
 }
 
 if ($CapacityId) {
