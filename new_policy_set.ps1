@@ -16,6 +16,10 @@
     "creationPayload" and "definition" are mutually exclusive. Use -DefinitionPayload to send a
     policySet.json item definition instead of a creation payload, or -BodyJson for a hand-written body.
 
+    The definition path must carry PolicySetDefinition.format = 'beta'; without it the request falls
+    through to the generic create-item-with-definition handler and fails with
+    "UnsupportedItemType - requested itemType PolicySet is unsupported".
+
     The operation is long running: the service answers 201 with the created policy set, or 202 with
     Location / x-ms-operation-id / Retry-After headers. On 202 this script polls the operation until it
     completes and then returns the created policy set, unless -NoWait is specified.
@@ -76,6 +80,10 @@ param(
     [Parameter(ParameterSetName = 'Definition')]
     [string]$PlatformPayload,
 
+    # PolicySetDefinition.format. 'beta' is the only value the preview accepts; '' omits the property.
+    [Parameter(ParameterSetName = 'Definition')]
+    [string]$DefinitionFormat = 'beta',
+
     [ValidateLength(0, 256)]
     [string]$Description = '',
 
@@ -129,10 +137,13 @@ switch ($PSCmdlet.ParameterSetName) {
             }
         }
 
+        $definition = @{ parts = $parts }
+        if ($DefinitionFormat) { $definition.format = $DefinitionFormat }
+
         $bodyMap = @{
             displayName = $DisplayName
             description = $Description
-            definition  = @{ parts = $parts }
+            definition  = $definition
         }
         if ($PSBoundParameters.ContainsKey('FolderId')) { $bodyMap.folderId = $FolderId.ToString() }
 
