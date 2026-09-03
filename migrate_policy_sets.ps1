@@ -307,7 +307,7 @@ function Split-IntoBatches {
         Splits a workspace list into chunks of at most $Size, one chunk per rule.
     #>
     param(
-        [Parameter(Mandatory)][System.Collections.Generic.List[string]]$Values,
+        [Parameter(Mandatory)][string[]]$Values,
         [Parameter(Mandatory)][int]$Size
     )
 

@@ -11,6 +11,8 @@
 
         Rule 1        - deny all (Allow rule pointing at a sentinel workspace, so it never matches)
         Rule 2..n     - item.type AnyOf [<item type CSV>] AND workspace.id AnyOf [<workspace batch>]
+        Rule n+1..m   - workspace.id AnyOf [<exception batch>] with no item.type condition, so those
+                        workspaces may create anything. Only for the -ExceptionWorkspacesPercent share.
 
     The workspace count per policy set follows a realistic distribution rather than an even ramp:
     -ZeroWorkspacePercent of the sets get no workspaces at all (deny-all only, no rule 2),
@@ -38,6 +40,11 @@
     .\test_load_policy_sets.ps1 -WorkspaceId <ws> -CapacityId <cap> `
                                 -ItemTypeCsvPath .\fabric_item_types.csv -Count 5 -Confirm:$false
 .EXAMPLE
+    # Include exception workspaces on a fifth of the policy sets
+    .\test_load_policy_sets.ps1 -WorkspaceId <ws> -CapacityId <cap> `
+                                -ItemTypeCsvPath .\fabric_item_types.csv `
+                                -ExceptionWorkspacesPercent 20 -Confirm:$false
+.EXAMPLE
     # Tear the test data down
     .\test_load_policy_sets.ps1 -WorkspaceId <ws> -CapacityId <cap> `
                                 -ItemTypeCsvPath .\fabric_item_types.csv -Cleanup -Confirm:$false
@@ -64,6 +71,14 @@ param(
     # Share of policy sets with just 1-2 whitelisted workspaces.
     [ValidateRange(0, 100)]
     [int]$SmallWorkspacePercent = 30,
+
+    # Share of policy sets that also get exception workspaces, allowed to create any item type.
+    [ValidateRange(0, 100)]
+    [int]$ExceptionWorkspacesPercent = 0,
+
+    # Upper bound on exception workspaces per policy set.
+    [ValidateRange(1, 10000)]
+    [int]$MaxExceptionWorkspaces = 10,
 
     # Fixes the distribution so repeated runs are comparable.
     [int]$Seed = 42,
@@ -204,6 +219,23 @@ function Get-RuleDisplayName {
     $BaseName.Substring(0, $MaxLength - $Suffix.Length).TrimEnd() + $Suffix
 }
 
+function Split-IntoBatches {
+    <#
+        Splits a workspace list into chunks of at most $Size, one chunk per rule.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Values,
+        [Parameter(Mandatory)][int]$Size
+    )
+
+    $batches = @()
+    for ($start = 0; $start -lt $Values.Count; $start += $Size) {
+        $end = [Math]::Min($start + $Size, $Values.Count) - 1
+        $batches += , @($Values[$start..$end])
+    }
+    , $batches
+}
+
 # ---------------------------------------------------------------------------
 # Cleanup mode
 # ---------------------------------------------------------------------------
@@ -314,8 +346,27 @@ for ($n = $workspaceCounts.Count - 1; $n -gt 0; $n--) {
     $workspaceCounts[$swap] = $temp
 }
 
+# Exception workspaces, spread 1..-MaxExceptionWorkspaces over the chosen share of sets.
+$exceptionSetCount = [int][Math]::Round($Count * $ExceptionWorkspacesPercent / 100)
+$exceptionCounts = New-Object System.Collections.Generic.List[int]
+for ($n = 0; $n -lt $exceptionSetCount; $n++) {
+    $exceptionCounts.Add(1 + ($n % $MaxExceptionWorkspaces))
+}
+for ($n = $exceptionSetCount; $n -lt $Count; $n++) { $exceptionCounts.Add(0) }
+
+for ($n = $exceptionCounts.Count - 1; $n -gt 0; $n--) {
+    $swap = $random.Next($n + 1)
+    $temp = $exceptionCounts[$n]
+    $exceptionCounts[$n] = $exceptionCounts[$swap]
+    $exceptionCounts[$swap] = $temp
+}
+
 Write-Host ("Workspaces per set: {0} with none, {1} with 1-2, {2} larger (max {3}); {4} item type(s); no activation." -f `
     $zeroCount, $smallCount, $largeCount, $MaxWorkspaces, $allowedItemTypes.Count) -ForegroundColor Cyan
+if ($exceptionSetCount -gt 0) {
+    Write-Host ("Exception sets    : {0} of {1} also get 1-{2} unrestricted workspace(s)." -f `
+        $exceptionSetCount, $Count, $MaxExceptionWorkspaces) -ForegroundColor Cyan
+}
 
 $results = @()
 $runStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -333,11 +384,20 @@ for ($i = 1; $i -le $Count; $i++) {
     )
     $workspaces = @($workspaces | Select-Object -Unique)
 
+    # A different UUID variant keeps exception IDs from colliding with the whitelisted ones above.
+    $exceptionCount = $exceptionCounts[$i - 1]
+    $exceptionWorkspaces = @(
+        for ($w = 0; $w -lt $exceptionCount; $w++) {
+            '{0:x8}-0000-4000-9000-{1:x12}' -f $i, $w
+        }
+    )
+
     $result = [pscustomobject]@{
         index       = $i
         policySetName = $name
         policySetId = $null
         workspaces  = $workspaces.Count
+        exceptions  = $exceptionWorkspaces.Count
         rules       = 0
         createMs    = 0
         rulesMs     = 0
@@ -357,11 +417,7 @@ for ($i = 1; $i -le $Count; $i++) {
         )
 
         if ($workspaces.Count -gt 0) {
-            $batches = @()
-            for ($start = 0; $start -lt $workspaces.Count; $start += $MaxWorkspacesPerRule) {
-                $end = [Math]::Min($start + $MaxWorkspacesPerRule, $workspaces.Count) - 1
-                $batches += , @($workspaces[$start..$end])
-            }
+            $batches = Split-IntoBatches -Values $workspaces -Size $MaxWorkspacesPerRule
 
             $batchNumber = 0
             foreach ($batch in $batches) {
@@ -380,12 +436,29 @@ for ($i = 1; $i -le $Count; $i++) {
             }
         }
 
+        if ($exceptionWorkspaces.Count -gt 0) {
+            $exceptionBatches = Split-IntoBatches -Values $exceptionWorkspaces -Size $MaxWorkspacesPerRule
+
+            $batchNumber = 0
+            foreach ($batch in $exceptionBatches) {
+                $batchNumber++
+                $suffix = if ($exceptionBatches.Count -gt 1) { " ($batchNumber/$($exceptionBatches.Count))" } else { '' }
+
+                $rules += @{
+                    displayName = Get-RuleDisplayName -BaseName 'Unrestricted item creation for exception workspaces' -Suffix $suffix
+                    description = "Allow any governed Fabric item type in $($batch.Count) exception workspace(s); the item type whitelist does not apply to them."
+                    conditions  = @(New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $batch)
+                    effects     = @(@{ type = 'Allow' })
+                }
+            }
+        }
+
         if ($rules.Count -gt $MaxRulesPerPolicy) {
             throw "$($rules.Count) rules exceed the $MaxRulesPerPolicy-rule limit for policy '$Policy'."
         }
         $result.rules = $rules.Count
 
-        if (-not $PSCmdlet.ShouldProcess("workspace $WorkspaceId", "Create '$name' with $($rules.Count) rule(s) over $($workspaces.Count) workspace(s)")) {
+        if (-not $PSCmdlet.ShouldProcess("workspace $WorkspaceId", "Create '$name' with $($rules.Count) rule(s) over $($workspaces.Count) workspace(s) and $($exceptionWorkspaces.Count) exception(s)")) {
             $results += $result
             continue
         }
@@ -427,8 +500,8 @@ for ($i = 1; $i -le $Count; $i++) {
     $results += $result
 
     if (-not $result.error -and $result.policySetId) {
-        Write-Host ("[{0}/{1}] {2}  ws={3,-4} rules={4,-3} create={5,6} ms  rules={6,6} ms" -f `
-            $i, $Count, $name, $result.workspaces, $result.rules, $result.createMs, $result.rulesMs) -ForegroundColor DarkGray
+        Write-Host ("[{0}/{1}] {2}  ws={3,-4} exc={4,-4} rules={5,-3} create={6,6} ms  rules={7,6} ms" -f `
+            $i, $Count, $name, $result.workspaces, $result.exceptions, $result.rules, $result.createMs, $result.rulesMs) -ForegroundColor DarkGray
     }
 
     if ($DelayBetweenSetsMs -gt 0) { Start-Sleep -Milliseconds $DelayBetweenSetsMs }
@@ -454,6 +527,9 @@ if ($succeeded.Count -gt 0) {
         ($succeeded.workspaces | Measure-Object -Minimum).Minimum,
         ($succeeded.workspaces | Measure-Object -Maximum).Maximum,
         ($succeeded.workspaces | Measure-Object -Sum).Sum)
+    Write-Host ("Exceptions       : {0} set(s), {1} workspace(s) total" -f `
+        @($succeeded | Where-Object { $_.exceptions -gt 0 }).Count,
+        ($succeeded.exceptions | Measure-Object -Sum).Sum)
     Write-Host ("Rules per set    : max {0}" -f ($succeeded.rules | Measure-Object -Maximum).Maximum)
 
     foreach ($metric in 'createMs', 'rulesMs') {
