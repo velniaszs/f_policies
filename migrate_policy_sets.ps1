@@ -17,6 +17,9 @@
                     only added when the workspace CSV lists workspaces for the capacity. A condition
                     holds at most -MaxWorkspacesPerRule workspaces, so longer whitelists are split
                     over several identical rules ("... (1/3)", "... (2/3)", ...).
+           Rule 3 - workspace.id AnyOf [<exception CSV>], with no item.type condition, so the listed
+                    workspaces may create any governed item type. Only added when -ExceptionCsvPath
+                    is supplied and lists workspaces for the capacity. Split the same way as rule 2.
       3. Activate the policy set on the capacity.
 
     Rules are written with POST .../policyRules/replaceByPolicy, which overwrites all rules of the
@@ -39,11 +42,23 @@
 
     See fabric_item_types.csv for the expected shape.
 
+    -ExceptionCsvPath is optional and uses the same columns as -CsvPath:
+
+        capacity_id,workspace_id
+
+    Workspaces listed there are exempt from the item type whitelist and may create anything the
+    policy governs. See fabric_workspaces_exceptions.sample.csv for the expected shape.
+
     HTTP 429 responses are retried up to -MaxRetries times, honouring the Retry-After header and
     falling back to -RetryAfterSeconds when the service does not send one.
 .EXAMPLE
     .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv `
                               -ItemTypeCsvPath .\fabric_item_types.csv -WhatIf
+.EXAMPLE
+    # Include the workspaces that are allowed to create anything
+    .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv `
+                              -ItemTypeCsvPath .\fabric_item_types.csv `
+                              -ExceptionCsvPath .\fabric_workspaces_exceptions.csv -Confirm:$false
 .EXAMPLE
     .\migrate_policy_sets.ps1 -WorkspaceId <ws> -CsvPath .\fabric_workspaces.csv `
                               -ItemTypeCsvPath .\fabric_item_types.csv -AllowReplace -Confirm:$false
@@ -65,6 +80,10 @@ param(
     [Parameter(Mandatory)]
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
     [string]$ItemTypeCsvPath,
+
+    # Optional. Workspaces allowed to create any governed item type, ignoring -ItemTypeCsvPath.
+    [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
+    [string]$ExceptionCsvPath,
 
     [guid[]]$CapacityId,
 
@@ -242,43 +261,76 @@ function ConvertTo-ItemDisplayName {
     $clean
 }
 
+function Get-WorkspacesByCapacity {
+    <#
+        Reads a capacity_id,workspace_id CSV into a capacity -> workspace list map.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $rows = @(Import-Csv -LiteralPath $Path)
+    if ($rows.Count -eq 0) { throw "CSV '$Path' is empty." }
+
+    $columns = $rows[0].PSObject.Properties.Name
+    foreach ($required in 'capacity_id', 'workspace_id') {
+        if ($columns -notcontains $required) {
+            throw "CSV '$Path' is missing the '$required' column. Found: $($columns -join ', ')."
+        }
+    }
+
+    $map = @{}   # PowerShell hashtables are case-insensitive, so GUID casing does not matter.
+    $rowNumber = 1
+    foreach ($row in $rows) {
+        $rowNumber++
+        $capacityKey = "$($row.capacity_id)".Trim()
+        $workspaceKey = "$($row.workspace_id)".Trim()
+        if (-not $capacityKey -and -not $workspaceKey) { continue }
+
+        $parsed = [guid]::Empty
+        if (-not [guid]::TryParse($capacityKey, [ref]$parsed) -or -not [guid]::TryParse($workspaceKey, [ref]$parsed)) {
+            Write-Warning "Row $rowNumber of $Path skipped: '$capacityKey' / '$workspaceKey' is not a GUID pair."
+            continue
+        }
+
+        if (-not $map.ContainsKey($capacityKey)) {
+            $map[$capacityKey] = New-Object System.Collections.Generic.List[string]
+        }
+        if (-not $map[$capacityKey].Contains($workspaceKey)) {
+            $map[$capacityKey].Add($workspaceKey)
+        }
+    }
+
+    $map
+}
+
+function Split-IntoBatches {
+    <#
+        Splits a workspace list into chunks of at most $Size, one chunk per rule.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Collections.Generic.List[string]]$Values,
+        [Parameter(Mandatory)][int]$Size
+    )
+
+    $batches = @()
+    for ($start = 0; $start -lt $Values.Count; $start += $Size) {
+        $end = [Math]::Min($start + $Size, $Values.Count) - 1
+        $batches += , @($Values[$start..$end])
+    }
+    , $batches
+}
+
 # ---------------------------------------------------------------------------
 # CSV - capacity_id -> workspace_id[]
 # ---------------------------------------------------------------------------
 
-$rows = @(Import-Csv -LiteralPath $CsvPath)
-if ($rows.Count -eq 0) { throw "CSV '$CsvPath' is empty." }
-
-$columns = $rows[0].PSObject.Properties.Name
-foreach ($required in 'capacity_id', 'workspace_id') {
-    if ($columns -notcontains $required) {
-        throw "CSV '$CsvPath' is missing the '$required' column. Found: $($columns -join ', ')."
-    }
-}
-
-$workspacesByCapacity = @{}   # PowerShell hashtables are case-insensitive, so GUID casing does not matter.
-$rowNumber = 1
-foreach ($row in $rows) {
-    $rowNumber++
-    $capacityKey = "$($row.capacity_id)".Trim()
-    $workspaceKey = "$($row.workspace_id)".Trim()
-    if (-not $capacityKey -and -not $workspaceKey) { continue }
-
-    $parsed = [guid]::Empty
-    if (-not [guid]::TryParse($capacityKey, [ref]$parsed) -or -not [guid]::TryParse($workspaceKey, [ref]$parsed)) {
-        Write-Warning "Row $rowNumber of $CsvPath skipped: '$capacityKey' / '$workspaceKey' is not a GUID pair."
-        continue
-    }
-
-    if (-not $workspacesByCapacity.ContainsKey($capacityKey)) {
-        $workspacesByCapacity[$capacityKey] = New-Object System.Collections.Generic.List[string]
-    }
-    if (-not $workspacesByCapacity[$capacityKey].Contains($workspaceKey)) {
-        $workspacesByCapacity[$capacityKey].Add($workspaceKey)
-    }
-}
-
+$workspacesByCapacity = Get-WorkspacesByCapacity -Path $CsvPath
 Write-Verbose "CSV mapped $($workspacesByCapacity.Count) capacity(ies) to workspaces."
+
+$exceptionsByCapacity = @{}
+if ($ExceptionCsvPath) {
+    $exceptionsByCapacity = Get-WorkspacesByCapacity -Path $ExceptionCsvPath
+    Write-Verbose "Exception CSV mapped $($exceptionsByCapacity.Count) capacity(ies) to unrestricted workspaces."
+}
 
 # ---------------------------------------------------------------------------
 # CSV - allowed item types
@@ -395,6 +447,7 @@ foreach ($capacity in $capacities) {
         policySetId  = $null
         action       = 'Skipped'
         workspaces   = 0
+        exceptions   = 0
         rules        = 0
         activated    = $false
         createMs     = 0
@@ -478,11 +531,7 @@ foreach ($capacity in $capacities) {
             $result.workspaces = $approved.Count
             # A single workspace.id condition holds at most -MaxWorkspacesPerRule values, so long
             # whitelists are spread over several otherwise identical rules.
-            $batches = @()
-            for ($start = 0; $start -lt $approved.Count; $start += $MaxWorkspacesPerRule) {
-                $end = [Math]::Min($start + $MaxWorkspacesPerRule, $approved.Count) - 1
-                $batches += , @($approved[$start..$end])
-            }
+            $batches = Split-IntoBatches -Values $approved -Size $MaxWorkspacesPerRule
 
             $batchNumber = 0
             foreach ($batch in $batches) {
@@ -508,8 +557,31 @@ foreach ($capacity in $capacities) {
             Write-Warning "No workspaces in the CSV for capacity $($capacity.id); deny-all only, so no governed item type can be created on it."
         }
 
+        # Exception workspaces get no item.type condition, so every governed item type is allowed.
+        $unrestricted = $exceptionsByCapacity[$capacity.id]
+        if ($unrestricted -and $unrestricted.Count -gt 0) {
+            $result.exceptions = $unrestricted.Count
+            $exceptionBatches = Split-IntoBatches -Values $unrestricted -Size $MaxWorkspacesPerRule
+
+            $batchNumber = 0
+            foreach ($batch in $exceptionBatches) {
+                $batchNumber++
+                $suffix = if ($exceptionBatches.Count -gt 1) { " ($batchNumber/$($exceptionBatches.Count))" } else { '' }
+
+                $rules += @{
+                    displayName = Get-RuleDisplayName -BaseName 'Unrestricted item creation for exception workspaces' -Suffix $suffix
+                    description = "Allow any governed Fabric item type in $($batch.Count) exception workspace(s); the item type whitelist does not apply to them."
+                    conditions  = @(New-DynamicCondition -TargetProperty 'workspace.id' -Operator 'AnyOf' -Values $batch)
+                    effects     = @(@{ type = 'Allow' })
+                }
+            }
+
+            Write-Host ("{0} exception workspace(s) allowed to create anything, across {1} rule(s)." -f `
+                $unrestricted.Count, $exceptionBatches.Count) -ForegroundColor DarkGray
+        }
+
         if ($rules.Count -gt $MaxRulesPerPolicy) {
-            throw "$($rules.Count) rules exceed the $MaxRulesPerPolicy-rule limit for policy '$Policy'. Reduce the whitelist for capacity $($capacity.id) or raise -MaxWorkspacesPerRule."
+            throw "$($rules.Count) rules exceed the $MaxRulesPerPolicy-rule limit for policy '$Policy'. Reduce the whitelist or exception list for capacity $($capacity.id), or raise -MaxWorkspacesPerRule."
         }
 
         $result.rules = $rules.Count
@@ -571,9 +643,9 @@ foreach ($capacity in $capacities) {
     }
 
     if (-not $result.error -and $result.policySetId) {
-        Write-Host ("[{0}/{1}] {2,-28} {3,-9} ws={4,-4} rules={5,-3} create={6,6} ms  rules={7,6} ms  activate={8,6} ms" -f `
+        Write-Host ("[{0}/{1}] {2,-28} {3,-9} ws={4,-4} exc={5,-4} rules={6,-3} create={7,6} ms  rules={8,6} ms  activate={9,6} ms" -f `
             $index, $capacities.Count, $result.capacityName, $result.action,
-            $result.workspaces, $result.rules,
+            $result.workspaces, $result.exceptions, $result.rules,
             $result.createMs, $result.rulesMs, $result.activateMs) -ForegroundColor DarkGray
     }
 
@@ -584,7 +656,7 @@ $runStopwatch.Stop()
 
 Write-Host ''
 Write-Host '=== Summary ===' -ForegroundColor Cyan
-$results | Format-Table capacityName, policySetName, action, workspaces, rules, activated, totalMs -AutoSize | Out-Host
+$results | Format-Table capacityName, policySetName, action, workspaces, exceptions, rules, activated, totalMs -AutoSize | Out-Host
 
 $succeeded = @($results | Where-Object { -not $_.error -and $_.policySetId })
 $failed    = @($results | Where-Object { $_.error })

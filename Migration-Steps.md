@@ -11,6 +11,15 @@ Copy-Item .\fabric_workspaces.sample.csv .\fabric_workspaces.csv
 # replace the dummy rows with real capacity_id,workspace_id pairs
 ```
 
+Optionally create the exception file for workspaces that may create **anything**:
+
+```powershell
+Copy-Item .\fabric_workspaces_exceptions.sample.csv .\fabric_workspaces_exceptions.csv
+# replace the dummy rows with real capacity_id,workspace_id pairs
+```
+
+Leave `-ExceptionCsvPath` off the commands below if there are no exceptions.
+
 ## 1. Dry run
 
 Builds every payload, calls nothing.
@@ -19,6 +28,7 @@ Builds every payload, calls nothing.
 .\migrate_policy_sets.ps1 -WorkspaceId <ws> `
     -CsvPath .\fabric_workspaces.csv `
     -ItemTypeCsvPath .\fabric_item_types.csv `
+    -ExceptionCsvPath .\fabric_workspaces_exceptions.csv `
     -SkipActivate -WhatIf
 ```
 
@@ -28,6 +38,7 @@ Builds every payload, calls nothing.
 .\migrate_policy_sets.ps1 -WorkspaceId <ws> `
     -CsvPath .\fabric_workspaces.csv `
     -ItemTypeCsvPath .\fabric_item_types.csv `
+    -ExceptionCsvPath .\fabric_workspaces_exceptions.csv `
     -CapacityId <one-cap> -SkipActivate -Confirm:$false
 ```
 
@@ -37,6 +48,7 @@ Builds every payload, calls nothing.
 .\migrate_policy_sets.ps1 -WorkspaceId <ws> `
     -CsvPath .\fabric_workspaces.csv `
     -ItemTypeCsvPath .\fabric_item_types.csv `
+    -ExceptionCsvPath .\fabric_workspaces_exceptions.csv `
     -SkipActivate -Confirm:$false
 ```
 
@@ -47,7 +59,7 @@ Builds every payload, calls nothing.
 .\get_policy_rule.ps1 -WorkspaceId <ws> -PolicySetId <ps> -ShowFilters
 ```
 
-All should show `status = Inactive` with the deny-all rule plus the expected whitelist rules.
+All should show `status = Inactive` with the deny-all rule plus the expected whitelist and exception rules.
 
 ## 5. Activate
 
@@ -57,6 +69,7 @@ Same command without `-SkipActivate` — it finds the existing sets and activate
 .\migrate_policy_sets.ps1 -WorkspaceId <ws> `
     -CsvPath .\fabric_workspaces.csv `
     -ItemTypeCsvPath .\fabric_item_types.csv `
+    -ExceptionCsvPath .\fabric_workspaces_exceptions.csv `
     -AllowReplace -Confirm:$false
 ```
 
@@ -95,4 +108,6 @@ $ws = '<workspace-id>'
 - Only Fabric (`F*` SKU) capacities are processed. Power BI SKUs (`P`/`A`/`EM`/`PP`) are reported as skipped and ignored.
 - `-AllowReplace` is needed if another policy set is already active on a capacity, otherwise you get `PolicySetActivationConflict`.
 - A capacity **missing from the CSV** gets the deny-all rule only, blocking all governed item creation once activated. Check the warnings from step 3 before activating.
+- Workspaces in the **exception CSV** get a rule with no item type condition, so they can create any governed item type. The deny-all baseline is still written for every capacity; the whitelist and exception rules are only added when the CSVs list rows for that capacity.
+- The exception list is not cross-checked against the whitelist — the business owns verifying both files before they are sent.
 - Re-runs are safe: existing sets are reused (`action = Updated`) and rules are overwritten, not duplicated.
